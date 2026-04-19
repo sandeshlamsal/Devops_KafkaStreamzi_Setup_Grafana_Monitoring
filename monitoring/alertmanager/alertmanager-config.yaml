@@ -1,0 +1,39 @@
+# AlertmanagerConfig — wire up your Slack webhook URL in the secret below.
+# kubectl create secret generic alertmanager-secrets -n monitoring \
+#   --from-literal=slack-webhook-url=https://hooks.slack.com/services/xxx
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: kafka-alertmanager-config
+  namespace: monitoring
+spec:
+  route:
+    groupBy: ["alertname"]
+    groupWait: 30s
+    groupInterval: 5m
+    repeatInterval: 1h
+    receiver: slack-warnings
+    routes:
+      - matchers:
+          - name: severity
+            value: critical
+        receiver: slack-critical
+  receivers:
+    - name: slack-critical
+      slackConfigs:
+        - apiURL:
+            name: alertmanager-secrets
+            key: slack-webhook-url
+          channel: "#kafka-critical"
+          title: "CRITICAL: {{ .GroupLabels.alertname }}"
+          text: "{{ range .Alerts }}{{ .Annotations.description }}\n{{ end }}"
+          sendResolved: true
+    - name: slack-warnings
+      slackConfigs:
+        - apiURL:
+            name: alertmanager-secrets
+            key: slack-webhook-url
+          channel: "#kafka-warnings"
+          title: "WARNING: {{ .GroupLabels.alertname }}"
+          text: "{{ range .Alerts }}{{ .Annotations.description }}\n{{ end }}"
+          sendResolved: true

@@ -1,0 +1,75 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kafka-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: kafka.broker
+      rules:
+        - alert: KafkaBrokerDown
+          expr: count(up{job=~".*kafka.*"} == 0) > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Kafka broker is down"
+            description: "{{ $value }} Kafka broker(s) are not reachable."
+
+        - alert: KafkaUnderReplicatedPartitions
+          expr: kafka_server_replicamanager_underreplicatedpartitions > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Under-replicated partitions detected"
+            description: "Broker {{ $labels.pod }} has {{ $value }} under-replicated partitions."
+
+        - alert: KafkaOfflinePartitions
+          expr: kafka_controller_kafkacontroller_offlinepartitionscount > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Offline partitions detected"
+            description: "There are {{ $value }} offline partitions."
+
+        - alert: KafkaConsumerLagHigh
+          expr: sum(kafka_consumer_group_lag) by (group, topic) > 5000
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High consumer lag"
+            description: "Consumer group {{ $labels.group }} on topic {{ $labels.topic }} has lag {{ $value }}."
+
+        - alert: KafkaDiskUsageHigh
+          expr: >
+            (kubelet_volume_stats_used_bytes{persistentvolumeclaim=~"data-.*kafka.*"} /
+             kubelet_volume_stats_capacity_bytes{persistentvolumeclaim=~"data-.*kafka.*"}) > 0.75
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Kafka disk usage above 75%"
+            description: "PVC {{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} full."
+
+        - alert: KafkaISRShrinkage
+          expr: kafka_server_replicamanager_isrshrinkspersec > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "ISR shrinkage detected"
+            description: "ISR shrinkage occurring on broker {{ $labels.pod }}."
+
+        - alert: KafkaActiveControllerCount
+          expr: kafka_controller_kafkacontroller_activecontrollercount != 1
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "No active Kafka controller"
+            description: "Active controller count is {{ $value }}, expected 1."

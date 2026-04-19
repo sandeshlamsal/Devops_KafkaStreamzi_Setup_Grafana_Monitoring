@@ -1,0 +1,13 @@
+# Docker Desktop uses the built-in hostpath provisioner.
+# No custom StorageClass is needed — use the default "hostpath" class.
+# This file documents the effective storage config for local dev.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: kafka-storage
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "false"
+provisioner: docker.io/hostpath
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+allowVolumeExpansion: false

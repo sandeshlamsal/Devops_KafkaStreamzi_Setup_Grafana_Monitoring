@@ -1,0 +1,16 @@
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: payments.orders.created.v1
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: production-kafka
+spec:
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "86400000"       # 1 day (reduced for local dev)
+    segment.bytes: "536870912"     # 512 MiB
+    min.insync.replicas: "2"
+    compression.type: lz4
+    cleanup.policy: delete

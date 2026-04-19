@@ -1,0 +1,25 @@
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: inventory-service
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: production-kafka
+spec:
+  authentication:
+    type: tls
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: topic
+          name: inventory.products.updated.v1
+          patternType: literal
+        operations: [Write, Describe, Create]
+        host: "*"
+      - resource:
+          type: group
+          name: inventory-service-group
+          patternType: literal
+        operations: [Read]
+        host: "*"
