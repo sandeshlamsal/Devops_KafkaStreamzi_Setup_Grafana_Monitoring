@@ -7,12 +7,12 @@ PROMETHEUS_STACK_VERSION="58.0.0"
 NS_KAFKA="kafka"
 NS_MONITORING="monitoring"
 
-echo "==> Verifying docker-desktop context..."
+echo "==> Verifying cluster context..."
 CURRENT_CTX=$(kubectl config current-context)
-if [[ "$CURRENT_CTX" != "docker-desktop" ]]; then
-  echo "ERROR: current context is '$CURRENT_CTX', expected 'docker-desktop'"
-  echo "Run: kubectl config use-context docker-desktop"
-  exit 1
+if [[ "$CURRENT_CTX" != "docker-desktop" && "$CURRENT_CTX" != k3d-* ]]; then
+  echo "WARNING: current context is '$CURRENT_CTX' (not docker-desktop or k3d-*)"
+  read -rp "Continue anyway? [y/N] " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || exit 1
 fi
 echo "    Context OK: $CURRENT_CTX"
 
@@ -28,12 +28,11 @@ helm repo add strimzi https://strimzi.io/charts/ --force-update
 helm upgrade --install strimzi-kafka-operator strimzi/strimzi-kafka-operator \
   --namespace $NS_KAFKA \
   --version $STRIMZI_VERSION \
-  --set watchNamespaces="{$NS_KAFKA}" \
   --set resources.requests.memory=256Mi \
   --set resources.requests.cpu=100m \
   --set resources.limits.memory=512Mi \
   --set resources.limits.cpu=500m \
-  --wait --timeout 3m
+  --wait --timeout 5m
 
 echo "==> Deploying Kafka cluster (KRaft mode)..."
 kubectl apply -f strimzi/cluster/node-pool.yaml  -n $NS_KAFKA
@@ -64,18 +63,39 @@ echo "==> Applying ServiceMonitors and alert rules..."
 kubectl apply -f monitoring/prometheus/servicemonitor-kafka.yaml
 kubectl apply -f monitoring/prometheus/rules/kafka-alerts.yaml
 
+echo "==> Applying Grafana datasource and dashboard ConfigMaps..."
+kubectl apply -f monitoring/grafana/datasource-prometheus.yaml
+kubectl apply -f monitoring/grafana/dashboards/
+
+echo "==> Deploying Schema Registry..."
+kubectl apply -f strimzi/schema-registry/schema-registry.yaml -n $NS_KAFKA
+
+echo "==> Deploying Kafka Connect..."
+kubectl apply -f strimzi/connect/kafka-connect.yaml -n $NS_KAFKA
+
+echo "==> Applying Network Policies..."
+kubectl apply -f network-policies/kafka-network-policy.yaml -n $NS_KAFKA
+kubectl apply -f network-policies/monitoring-network-policy.yaml -n $NS_MONITORING
+
+echo "==> Applying AlertManager config..."
+kubectl apply -f monitoring/alertmanager/alertmanager-config.yaml
+
 echo ""
 echo "======================================================"
 echo " Install complete!"
 echo "======================================================"
 echo ""
-echo "  Kafka bootstrap (internal plain):  production-kafka-kafka-bootstrap.$NS_KAFKA:9092"
-echo "  Kafka bootstrap (internal TLS):    production-kafka-kafka-bootstrap.$NS_KAFKA:9093"
+echo "  Kafka bootstrap (plain):   production-kafka-kafka-bootstrap.$NS_KAFKA:9092"
+echo "  Kafka bootstrap (TLS):     production-kafka-kafka-bootstrap.$NS_KAFKA:9093"
+echo "  Schema Registry:           schema-registry.$NS_KAFKA:8081"
 echo ""
-echo "  Grafana:  kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n $NS_MONITORING"
-echo "            http://localhost:3000  (admin / admin)"
+echo "  Grafana:    kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n $NS_MONITORING"
+echo "              http://localhost:3000  (admin / admin)"
 echo ""
 echo "  Prometheus: kubectl port-forward svc/kube-prometheus-stack-prometheus 9090:9090 -n $NS_MONITORING"
 echo "              http://localhost:9090"
+echo ""
+echo "  Schema Reg: kubectl port-forward svc/schema-registry 8081:8081 -n $NS_KAFKA"
+echo "              http://localhost:8081/subjects"
 echo ""
 echo "  Run ./scripts/verify-cluster.sh to confirm health."

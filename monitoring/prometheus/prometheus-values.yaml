@@ -14,7 +14,7 @@ prometheus:
       volumeClaimTemplate:
         spec:
           # Use docker-desktop default hostpath StorageClass
-          storageClassName: hostpath
+          storageClassName: local-path
           resources:
             requests:
               storage: 10Gi
@@ -30,7 +30,7 @@ grafana:
       cpu: 500m
   persistence:
     enabled: true
-    storageClassName: hostpath
+    storageClassName: local-path
     size: 2Gi
   sidecar:
     dashboards:

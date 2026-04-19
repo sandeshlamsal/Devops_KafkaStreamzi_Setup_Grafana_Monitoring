@@ -12,10 +12,10 @@ check() {
   local cmd="$2"
   if eval "$cmd" &>/dev/null; then
     echo "  [OK]  $label"
-    ((PASS++))
+    PASS=$((PASS+1))
   else
     echo "  [FAIL] $label"
-    ((FAIL++))
+    FAIL=$((FAIL+1))
   fi
 }
 
@@ -53,6 +53,27 @@ check "kafka-servicemonitor exists" \
   "kubectl get servicemonitor kafka-servicemonitor -n $NS_MONITORING"
 check "kafka-alerts PrometheusRule exists" \
   "kubectl get prometheusrule kafka-alerts -n $NS_MONITORING"
+
+echo ""
+echo "==> Kafka Connect"
+check "KafkaConnect CR exists" \
+  "kubectl get kafkaconnect production-connect -n $NS_KAFKA"
+check "Connect pod Running" \
+  "kubectl get pods -n $NS_KAFKA -l strimzi.io/kind=KafkaConnect --field-selector=status.phase=Running --no-headers | grep -q connect"
+
+echo ""
+echo "==> Schema Registry"
+check "Schema Registry deployment exists" \
+  "kubectl get deployment schema-registry -n $NS_KAFKA"
+check "Schema Registry pod Running" \
+  "kubectl get pods -n $NS_KAFKA -l app=schema-registry --field-selector=status.phase=Running --no-headers | grep -q schema-registry"
+
+echo ""
+echo "==> Network Policies"
+check "kafka-broker-network-policy exists" \
+  "kubectl get networkpolicy kafka-broker-network-policy -n $NS_KAFKA"
+check "prometheus-network-policy exists" \
+  "kubectl get networkpolicy prometheus-network-policy -n $NS_MONITORING"
 
 echo ""
 echo "======================================================"
