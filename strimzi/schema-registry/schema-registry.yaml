@@ -13,6 +13,9 @@ spec:
       labels:
         app: schema-registry
     spec:
+      # Prevents Kubernetes from injecting SCHEMA_REGISTRY_PORT=tcp://... env vars
+      # from other services, which Confluent's config parser misinterprets.
+      enableServiceLinks: false
       containers:
         - name: schema-registry
           image: confluentinc/cp-schema-registry:7.6.0

@@ -43,6 +43,10 @@ spec:
         - podSelector:
             matchLabels:
               strimzi.io/kind: Kafka
+    # Allow kafka-init to query node addresses for NodePort listener config
+    - ports:
+        - port: 443
+          protocol: TCP
     - ports:
         - port: 53
           protocol: UDP
