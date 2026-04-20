@@ -287,6 +287,709 @@ done
 
 ---
 
+## Strimzi Kafka — Component Deep Dive
+
+This section explains every component in the Strimzi Kafka ecosystem: what it is, why it exists, how it communicates with other components, and what breaks when it is absent.
+
+---
+
+### Full System Architecture
+
+```
+╔══════════════════════════════════════════════════════════════════════════════════════╗
+║                          Kubernetes Cluster                                         ║
+║                                                                                     ║
+║  ┌──────────────────────────────────────────────────────────────────────────────┐   ║
+║  │  namespace: kafka                                                            │   ║
+║  │                                                                              │   ║
+║  │  ┌─────────────────────┐      watches CRs      ┌────────────────────────┐  │   ║
+║  │  │   Strimzi Operator  │◄──────────────────────│  KafkaNodePool CR      │  │   ║
+║  │  │  (Deployment)       │                        │  Kafka CR              │  │   ║
+║  │  │                     │──── reconciles ──────► │  KafkaTopic CR         │  │   ║
+║  │  │  - Fabric8 k8s SDK  │                        │  KafkaUser CR          │  │   ║
+║  │  │  - Manages TLS CA   │                        │  KafkaConnect CR       │  │   ║
+║  │  └─────────────────────┘                        └────────────────────────┘  │   ║
+║  │          │                                                                   │   ║
+║  │          │ creates/manages                                                   │   ║
+║  │          ▼                                                                   │   ║
+║  │  ┌───────────────────────────────────────────────────┐                      │   ║
+║  │  │              Kafka Cluster (KRaft mode)           │                      │   ║
+║  │  │                                                   │                      │   ║
+║  │  │  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐                │   ║
+║  │  │  │  combined-0  │  │  combined-1  │  │  combined-2    │                │   ║
+║  │  │  │              │  │              │  │                │                │   ║
+║  │  │  │ ● Controller │  │ ● Controller │  │ ● Controller   │  (KRaft quorum)│   ║
+║  │  │  │ ● Broker     │  │ ● Broker     │  │ ● Broker       │  (data plane)  │   ║
+║  │  │  │              │  │              │  │                │                │   ║
+║  │  │  │ :9092 plain  │  │ :9092 plain  │  │ :9092 plain    │                │   ║
+║  │  │  │ :9093 TLS    │  │ :9093 TLS    │  │ :9093 TLS      │                │   ║
+║  │  │  │ :9091 inter  │◄─┤ :9091 inter  │◄─┤ :9091 inter    │                │   ║
+║  │  │  │ :9090 ctrl   │  │ :9090 ctrl   │  │ :9090 ctrl     │                │   ║
+║  │  │  │ :9404 JMX    │  │ :9404 JMX    │  │ :9404 JMX      │                │   ║
+║  │  │  └──────────────┘  └──────────────┘  └────────────────┘                │   ║
+║  │  │        PVC 10Gi           PVC 10Gi           PVC 10Gi                   │   ║
+║  │  └───────────────────────────────────────────────────────┘                  │   ║
+║  │                                                                              │   ║
+║  │  ┌──────────────────┐  ┌─────────────────┐  ┌────────────────────────────┐ │   ║
+║  │  │  Entity Operator │  │  Kafka Connect  │  │  Schema Registry           │ │   ║
+║  │  │  ┌─────────────┐ │  │  (production-   │  │  (cp-schema-registry:7.6) │ │   ║
+║  │  │  │Topic Operat.│ │  │   connect-0)    │  │                            │ │   ║
+║  │  │  │User Operato.│ │  │  :8083 REST API │  │  :8081 REST API            │ │   ║
+║  │  │  └─────────────┘ │  │  :9404 metrics  │  │  Stores schemas in         │ │   ║
+║  │  └──────────────────┘  └─────────────────┘  │  _schemas topic            │ │   ║
+║  │                                              └────────────────────────────┘ │   ║
+║  │  ┌──────────────────────────────────────────────────────────────────────┐   │   ║
+║  │  │  Kafka Exporter (danielqsj/kafka-exporter)                          │   │   ║
+║  │  │  Queries consumer group API every 30s → exposes on :9308/metrics    │   │   ║
+║  │  └──────────────────────────────────────────────────────────────────────┘   │   ║
+║  └──────────────────────────────────────────────────────────────────────────────┘   ║
+║                                                                                     ║
+║  ┌──────────────────────────────────────────────────────────────────────────────┐   ║
+║  │  namespace: monitoring                                                       │   ║
+║  │                                                                              │   ║
+║  │  ┌────────────────────────┐      ┌──────────────────┐  ┌─────────────────┐  │   ║
+║  │  │  Prometheus            │      │  Grafana         │  │  AlertManager   │  │   ║
+║  │  │  scrapes every 30s:    │─────►│  4 dashboards    │  │  7 alert rules  │  │   ║
+║  │  │  - :9404 (JMX/broker)  │      │  - Strimzi Kafka  │  │  Slack/PagerD. │  │   ║
+║  │  │  - :9308 (lag/exporter)│      │  - Kafka Exporter │  └─────────────────┘  │   ║
+║  │  │  - :9090 (self)        │      │  - Kafka Connect  │                       │   ║
+║  │  └────────────────────────┘      │  - Operators      │                       │   ║
+║  │  ┌────────────────────────┐      └──────────────────┘                       │   ║
+║  │  │  Prometheus Operator   │                                                  │   ║
+║  │  │  reads ServiceMonitor  │                                                  │   ║
+║  │  │  and PrometheusRule CRs│                                                  │   ║
+║  │  └────────────────────────┘                                                  │   ║
+║  └──────────────────────────────────────────────────────────────────────────────┘   ║
+╚══════════════════════════════════════════════════════════════════════════════════════╝
+```
+
+---
+
+### Component 1 — Apache Kafka Broker
+
+**What it is:** The core data store and message bus. A broker receives messages from producers, persists them to disk in topic-partition log segments, and serves them to consumers.
+
+**How it works:**
+
+```
+Producer                       Broker (combined-1, leader for partition 2)
+   │                                │
+   │── ProduceRequest(topic,p=2) ──►│
+   │                                │ 1. Write to partition log segment
+   │                                │    /var/kafka/data/payments.orders.created.v1-2/
+   │                                │    000000000000000001.log  (message bytes)
+   │                                │    000000000000000001.index (offset → file pos)
+   │                                │
+   │                                │ 2. Replicate to follower brokers (ISR)
+   │                                │    combined-0 :9091  ◄─── FetchRequest
+   │                                │    combined-2 :9091  ◄─── FetchRequest
+   │                                │
+   │◄─ ProduceResponse(offset=42) ──│ 3. Ack after min.insync.replicas confirmed
+   │
+Consumer
+   │── FetchRequest(topic,p=2,offset=42) ──►│
+   │◄─ FetchResponse(messages 42..52)  ──────│
+```
+
+**Key config in this repo:**
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| `offsets.topic.replication.factor` | 3 | Offset commits survive any single broker loss |
+| `min.insync.replicas` | 2 | Producer `acks=all` requires 2 replicas to confirm write |
+| `default.replication.factor` | 3 | User topics replicated across all 3 brokers |
+| `log.retention.hours` | 24 | Local dev — short retention to save disk |
+
+**Port map:**
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 9092 | PLAINTEXT | Internal client connections (producers/consumers) |
+| 9093 | TLS | Encrypted client connections |
+| 9091 | PLAINTEXT | Broker-to-broker replication (inter-broker) |
+| 9090 | PLAINTEXT | Controller-to-broker (KRaft cluster traffic) |
+| 9404 | HTTP | JMX Prometheus exporter (scraped by Prometheus) |
+
+---
+
+### Component 2 — KRaft Controller
+
+**What it is:** In KRaft mode (ZooKeeper-less Kafka), one or more brokers also run the **KRaft controller** role. Controllers manage cluster metadata: topic assignments, partition leadership, ISR state, and broker registrations. They replace the entire ZooKeeper ensemble.
+
+**How it works:**
+
+```
+                         KRaft Metadata Quorum (Raft consensus)
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                     │
+│   combined-0           combined-1           combined-2              │
+│   ┌──────────┐         ┌──────────┐         ┌──────────┐           │
+│   │Controller│◄───────►│Controller│◄───────►│Controller│           │
+│   │ (LEADER) │         │(FOLLOWER)│         │(FOLLOWER)│           │
+│   └────┬─────┘         └──────────┘         └──────────┘           │
+│        │                                                            │
+│        │  Metadata log (Raft entries):                              │
+│        │  - PartitionChange: payments.orders.created.v1 p0 → b1    │
+│        │  - BrokerRegistration: broker-2 online                    │
+│        │  - TopicCreate: inventory.products.updated.v1              │
+│        │                                                            │
+│   All metadata written to __cluster_metadata topic (internal)      │
+└─────────────────────────────────────────────────────────────────────┘
+         │
+         │ brokers fetch metadata from active controller
+         ▼
+   Broker data plane (9092/9093 client traffic)
+```
+
+**Why this matters over ZooKeeper:**
+- No separate ZooKeeper ensemble to manage, monitor, or upgrade
+- Metadata operations are faster (Raft vs ZK latency)
+- Single unified security model — no ZK ACLs to maintain separately
+- `KafkaNodePool` with `roles: [controller, broker]` means each node handles both — fine for dev, separate for prod
+
+---
+
+### Component 3 — Strimzi Operator
+
+**What it is:** A Kubernetes Operator (controller) that manages the entire Kafka cluster lifecycle via Custom Resources. You declare desired state in YAML; the operator reconciles the cluster to match.
+
+**Reconciliation loop:**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Strimzi Operator Pod                             │
+│                                                                     │
+│  Informer (watches CRs)                                             │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │  kafka.strimzi.io/v1beta2 events → reconcile queue        │    │
+│  └────────────────────────────┬───────────────────────────────┘    │
+│                               │                                     │
+│  Reconcile loop               ▼                                     │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │  1. Read current state (StrimziPodSet, Services, Secrets)  │    │
+│  │  2. Compute desired state from Kafka CR                    │    │
+│  │  3. Diff current vs desired                                │    │
+│  │  4. Apply changes:                                         │    │
+│  │     - Generate/rotate TLS certificates (cluster CA)        │    │
+│  │     - Create/update StrimziPodSet (replaces StatefulSet)   │    │
+│  │     - Create Services (bootstrap, broker, headless)        │    │
+│  │     - Create ConfigMaps (kafka config, JMX rules)          │    │
+│  │     - Rolling restart pods if config changed               │    │
+│  │  5. Update CR status conditions (Ready / NotReady)         │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                                                                     │
+│  Sub-operators running inside entity-operator pod:                  │
+│  ┌────────────────────────┐  ┌────────────────────────────────┐   │
+│  │    Topic Operator      │  │      User Operator             │   │
+│  │  KafkaTopic CR ──────► │  │  KafkaUser CR ──────────────► │   │
+│  │  kafka-topics.sh API   │  │  kafka-acls.sh API             │   │
+│  │  (creates real topics) │  │  (creates users + ACLs)        │   │
+│  └────────────────────────┘  └────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**What the operator manages automatically:**
+- Cluster CA and client certificates (rotated every 30 days by default)
+- Rolling restarts on config change (one pod at a time, waits for ISR)
+- StrimziPodSet (Strimzi's replacement for StatefulSet with finer restart control)
+- Bootstrap, broker-specific, and headless Services
+- Pod Disruption Budgets
+
+---
+
+### Component 4 — KafkaNodePool
+
+**What it is:** A CR that defines a pool of Kafka pods with a specific set of roles, resources, and storage. Replaces the `spec.kafka.replicas` and `spec.kafka.storage` fields in the Kafka CR when `strimzi.io/node-pools: enabled`.
+
+**Role separation (production):**
+
+```
+KafkaNodePool: controller          KafkaNodePool: broker
+roles: [controller]                roles: [broker]
+replicas: 3                        replicas: 3 (scale independently)
+storage: 20Gi (metadata log)       storage: 500Gi JBOD (message data)
+cpu: 1, memory: 4Gi                cpu: 4, memory: 16Gi
+
+         ▲                                  ▲
+         │                                  │
+         └──────────────┬───────────────────┘
+                        │
+                  Kafka CR (references both pools
+                   via strimzi.io/cluster label)
+```
+
+**Local dev (this repo) — combined pool:**
+```
+KafkaNodePool: combined
+roles: [controller, broker]   ← both roles in one pod
+replicas: 3                   ← 3 pods, each is controller + broker
+storage: 10Gi                 ← fine for testing, not prod
+```
+
+---
+
+### Component 5 — Topic Operator
+
+**What it is:** Watches `KafkaTopic` CRs and reconciles them to real Kafka topics via the Kafka Admin API. Lets you manage topics as Kubernetes resources in Git.
+
+**Data flow:**
+
+```
+Developer applies KafkaTopic CR:
+  kubectl apply -f strimzi/topics/orders-events.yaml
+
+         │
+         ▼
+Topic Operator (inside entity-operator pod)
+  ┌──────────────────────────────────────────────┐
+  │  1. Watch KafkaTopic CR                      │
+  │  2. Call Kafka Admin API:                    │
+  │     CreateTopics(                            │
+  │       name="payments.orders.created.v1",     │
+  │       numPartitions=6,                       │
+  │       replicationFactor=3,                   │
+  │       configs={retention.ms=86400000, ...}   │
+  │     )                                        │
+  │  3. Update CR status.conditions = Ready      │
+  └──────────────────────────────────────────────┘
+         │
+         ▼
+  Kafka Broker: topic created, partitions assigned across brokers
+
+Reverse sync (broker → CR):
+  If topic config changes directly in Kafka (e.g. via kafka-topics.sh),
+  the operator detects the drift and reconciles back to the CR definition.
+```
+
+---
+
+### Component 6 — User Operator
+
+**What it is:** Watches `KafkaUser` CRs and creates Kafka users with TLS certificates or SCRAM credentials, plus ACL rules — as Kubernetes Secrets.
+
+**TLS user flow:**
+
+```
+KafkaUser CR (payments-service)
+  authentication: tls
+  authorization: acls [Write+Read on payments.orders.created.v1]
+         │
+         ▼
+User Operator
+  ┌──────────────────────────────────────────────────────────────┐
+  │  1. Generate client keypair signed by cluster CA             │
+  │  2. Create Secret "payments-service" in kafka namespace:     │
+  │     data:                                                    │
+  │       user.crt: <base64 client cert>                         │
+  │       user.key: <base64 private key>                         │
+  │       user.p12: <PKCS12 keystore>                            │
+  │       user.password: <keystore password>                     │
+  │  3. Call Kafka Admin API:                                     │
+  │     CreateAcls(principal=User:CN=payments-service,           │
+  │       resource=Topic:payments.orders.created.v1,             │
+  │       operation=WRITE)                                       │
+  └──────────────────────────────────────────────────────────────┘
+         │
+         ▼
+Application mounts Secret as volume → authenticates with mTLS
+```
+
+---
+
+### Component 7 — Kafka Connect
+
+**What it is:** A distributed, scalable framework for streaming data between Kafka and external systems (databases, S3, Elasticsearch, REST APIs). It runs **Connectors** — plugins that know how to read from a source or write to a sink.
+
+**Architecture:**
+
+```
+External System                Kafka Connect Worker            Kafka Broker
+(e.g. PostgreSQL)              (production-connect-0)
+      │                               │                              │
+      │ Debezium CDC (source)         │                              │
+      │──── row change events ───────►│                              │
+      │                               │  Connector task              │
+      │                               │  ┌────────────────────┐     │
+      │                               │  │ SourceConnector    │     │
+      │                               │  │ reads WAL/binlog   │     │
+      │                               │  │ converts to Record │     │
+      │                               │  └────────┬───────────┘     │
+      │                               │           │                  │
+      │                               │           ▼                  │
+      │                               │  ProduceRequest ────────────►│
+      │                               │                              │ topic:
+      │                               │                              │ payments.orders.created.v1
+      │
+      │ (sink direction — S3 example)
+      │                     Kafka Broker                 S3
+      │                           │                       │
+      │           FetchRequest ◄──│                       │
+      │                           │   SinkConnector       │
+      │                           │   ┌──────────────┐    │
+      │                           │   │ reads msgs   │    │
+      │                           │   │ writes S3    │───►│
+      │                           │   └──────────────┘    │
+
+Config stored in internal Kafka topics:
+  connect-offsets   — where each task last read (checkpointing)
+  connect-configs   — connector configuration (persisted in Kafka)
+  connect-status    — connector/task status
+```
+
+**Internal REST API (port 8083) — deploy connectors at runtime:**
+```bash
+curl -X POST http://production-connect:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d '{"name":"pg-source","config":{"connector.class":"io.debezium.connector.postgresql.PostgresConnector",...}}'
+```
+
+---
+
+### Component 8 — Schema Registry
+
+**What it is:** A centralized store for Avro, JSON Schema, and Protobuf schemas. Producers register schemas; consumers fetch them by ID embedded in the message header. Ensures producers and consumers agree on data shape without embedding full schema in every message.
+
+**Message wire format:**
+
+```
+Kafka Message Value (with schema registry):
+┌───────────────────────────────────────────────────┐
+│  Magic byte: 0x00  (1 byte)                       │
+│  Schema ID:  42    (4 bytes, big-endian int)       │
+│  Avro payload: <binary Avro-encoded data>          │
+└───────────────────────────────────────────────────┘
+
+Producer flow:
+  1. Serialize record with Avro schema
+  2. POST /subjects/payments.orders.created.v1-value/versions
+     → Schema Registry stores schema, returns schema_id=42
+  3. Prepend magic+schema_id to Avro bytes → Kafka message
+
+Consumer flow:
+  1. Read Kafka message
+  2. Extract schema_id=42 from first 5 bytes
+  3. GET /schemas/ids/42  → fetch schema from registry
+  4. Deserialize Avro payload using fetched schema
+```
+
+**Schema evolution (compatibility modes):**
+
+```
+BACKWARD (default):
+  New schema can read data written by old schema
+  → Add fields with defaults ✅  / Remove fields ❌
+
+FORWARD:
+  Old schema can read data written by new schema
+
+FULL:
+  Both directions — most restrictive, safest for production
+
+NONE:
+  No compatibility check — dangerous in production
+```
+
+**Why `enableServiceLinks: false` is required in this setup:**
+Kubernetes injects `SCHEMA_REGISTRY_PORT=tcp://10.x.x.x:8081` as an env var. Confluent's config parser reads every `SCHEMA_REGISTRY_*` env var as a config key and fails to parse `tcp://` as a valid bootstrap address. Setting `enableServiceLinks: false` suppresses all service injection.
+
+---
+
+### Component 9 — Kafka Exporter
+
+**What it is:** A standalone Prometheus exporter (not part of Strimzi) that connects to Kafka as a consumer-group-aware client and exposes per-partition consumer lag as Prometheus metrics. The JMX exporter covers broker internals; the Kafka Exporter covers consumer health.
+
+**Data flow:**
+
+```
+Kafka Exporter Pod                    Prometheus
+(kafka-exporter:9308)
+       │                                    │
+       │ Every 30s:                         │
+       │  ListConsumerGroups                │
+       │  DescribeConsumerGroups            │
+       │  ListOffsets (end offsets)         │
+       │                                    │
+       │  lag = end_offset - committed_offset
+       │                                    │
+       │  /metrics endpoint                 │
+       │  kafka_consumergroup_lag{          │
+       │    consumergroup="payments-...",   │
+       │    topic="payments.orders...",     │
+       │    partition="2"                   │
+       │  } 334                             │
+       │                                    │
+       │◄─── GET /metrics ─────────────────│ (ServiceMonitor scrape)
+       │────  metrics text ────────────────►│
+                                            │
+                                            │  stores in time-series DB
+                                            ▼
+                                        Grafana
+                                   "Strimzi Kafka Exporter"
+                                   dashboard shows lag trend
+
+Key metrics:
+  kafka_consumergroup_lag{group,topic,partition}      per-partition lag
+  kafka_consumergroup_lag_sum{group,topic}            total lag per group
+  kafka_consumergroup_current_offset{group,topic,p}   committed offset
+  kafka_topic_partition_current_offset{topic,p}       end offset
+  kafka_topic_partition_oldest_offset{topic,p}        start offset
+```
+
+---
+
+### Component 10 — JMX Prometheus Exporter (in-process)
+
+**What it is:** A Java agent running inside each Kafka broker JVM that exposes Kafka's internal JMX metrics as Prometheus text format on port `:9404`. It is configured via a `ConfigMap` (`kafka-metrics-config`) that defines JMX → Prometheus metric name mapping rules.
+
+**Metric categories exposed:**
+
+```
+Broker JVM (port 9404)
+       │
+       ├── kafka_server_BrokerTopicMetrics_*
+       │     MessagesInPerSec         ← messages produced per second
+       │     BytesInPerSec            ← bytes produced per second
+       │     BytesOutPerSec           ← bytes consumed per second
+       │     FailedProduceRequestsPerSec
+       │
+       ├── kafka_server_ReplicaManager_*
+       │     UnderReplicatedPartitions ← partitions not fully replicated (alert trigger)
+       │     PartitionCount            ← partitions led by this broker
+       │     LeaderCount
+       │     IsrShrinks/Expands        ← ISR membership changes
+       │
+       ├── kafka_controller_KafkaController_*
+       │     ActiveControllerCount     ← must always be 1 (alert if != 1)
+       │     OfflinePartitionsCount    ← must always be 0 (alert if > 0)
+       │     PreferredReplicaImbalanceCount
+       │
+       ├── kafka_network_RequestMetrics_*
+       │     RequestsPerSec{request="Produce"}
+       │     TotalTimeMs{request="FetchConsumer"}
+       │
+       └── jvm_*  (GC, heap, threads)
+```
+
+---
+
+### Component 11 — Prometheus
+
+**What it is:** A time-series database and scrape engine. Prometheus pulls (`scrapes`) metrics from configured targets at fixed intervals and stores them. It also evaluates alert rules and fires to AlertManager.
+
+**How ServiceMonitor wires it up:**
+
+```
+ServiceMonitor CR (kafka-servicemonitor)         ← you define this
+       │
+       │  namespaceSelector: kafka
+       │  selector: matchLabels strimzi.io/kind=Kafka
+       │  endpoints: port tcp-prometheus, interval 30s
+       ▼
+Prometheus Operator                              ← reads ServiceMonitor CRs
+       │  generates prometheus.yml scrape_configs
+       │
+       ▼
+Prometheus Pod
+  scrape loop every 30s:
+  ┌───────────────────────────────────────────────────────────────┐
+  │  GET http://production-kafka-kafka-brokers:9404/metrics      │ JMX
+  │  GET http://kafka-exporter:9308/metrics                      │ lag
+  │  parse text format → store as time series                    │
+  │  evaluate alert rules → fire to AlertManager if threshold    │
+  └───────────────────────────────────────────────────────────────┘
+
+Query language (PromQL examples):
+  kafka_server_replicamanager_underreplicatedpartitions > 0
+  sum by (consumergroup,topic)(kafka_consumergroup_lag_sum)
+  rate(kafka_server_brokertopicmetrics_messagesinpersec_count[5m])
+```
+
+---
+
+### Component 12 — Grafana
+
+**What it is:** Visualization layer. Queries Prometheus via PromQL and renders dashboards. The **sidecar container** (`grafana-sc-dashboard`) watches for ConfigMaps with label `grafana_dashboard: "1"` and hot-reloads them as dashboards without restarting Grafana.
+
+**Sidecar dashboard loading:**
+
+```
+ConfigMap (grafana-dashboard-strimzi-kafka)
+  labels:
+    grafana_dashboard: "1"
+  data:
+    strimzi-kafka.json: |<full dashboard JSON>
+         │
+         │  sidecar watches all ConfigMaps in cluster
+         ▼
+Grafana Pod (grafana-sc-dashboard sidecar container)
+  watches Kubernetes API for ConfigMaps with grafana_dashboard=1
+         │
+         │  writes JSON to /tmp/dashboards/strimzi-kafka.json
+         ▼
+Grafana main container
+  reads /tmp/dashboards/*.json on a 30s poll
+  → dashboard appears in UI with no restart
+
+4 dashboards in this repo (from strimzi-kafka-operator v0.44.0):
+  ┌──────────────────────┬────────────────────────────────────────────┐
+  │ Strimzi Kafka        │ Broker health: messages/sec, under-replicated │
+  │ Strimzi Kafka Export.│ Consumer group lag trends per partition      │
+  │ Strimzi Kafka Connect│ Connector status, task error rates           │
+  │ Strimzi Operators    │ Operator reconciliation rate, error counts   │
+  └──────────────────────┴────────────────────────────────────────────┘
+```
+
+---
+
+### Component 13 — AlertManager
+
+**What it is:** Receives alerts from Prometheus, deduplicates them, groups them, and routes them to receivers (Slack, PagerDuty, email, webhook). It handles silences and inhibition rules.
+
+**Alert lifecycle:**
+
+```
+Prometheus evaluates rule every 30s:
+  KafkaUnderReplicatedPartitions:
+    expr: kafka_server_replicamanager_underreplicatedpartitions > 0
+    for: 5m          ← must be true for 5 continuous minutes before firing
+
+  t=0m   metric > 0   → state: PENDING
+  t=5m   metric > 0   → state: FIRING → sends alert to AlertManager
+
+AlertManager routing tree:
+  alert: KafkaUnderReplicatedPartitions (severity=warning)
+       │
+       ├── groupBy: [alertname, cluster]
+       ├── groupWait: 30s  (collect related alerts before sending)
+       ├── groupInterval: 5m
+       └── repeatInterval: 12h
+             │
+             ▼
+        slack-warning receiver → POST to #kafka-warnings webhook
+
+  alert: KafkaBrokerDown (severity=critical)
+             │
+             ▼
+        pagerduty-critical receiver → create incident
+```
+
+**7 rules in this repo:**
+
+```
+Rule                         Threshold           Severity
+────────────────────────────────────────────────────────
+KafkaBrokerDown              any broker down     critical
+KafkaUnderReplicatedPartitions > 0 for 5m       warning
+KafkaOfflinePartitions       > 0 for 1m         critical
+KafkaConsumerLagHigh         sum lag > 10,000   warning
+KafkaDiskUsageHigh           PVC > 80%          warning
+KafkaISRShrinkage            shrink rate > 0    warning
+KafkaActiveControllerCount   count != 1         critical
+```
+
+---
+
+### Component 14 — Network Policies
+
+**What it is:** Kubernetes-native firewall rules that restrict which pods can talk to which ports. Critical for multi-tenant clusters and compliance.
+
+**Full traffic map:**
+
+```
+┌──────── namespace: kafka ─────────────────────────────────────────┐
+│                                                                    │
+│  Kafka Broker pods                                                │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  INGRESS allowed from:                                   │    │
+│  │    strimzi-cluster-operator    → :9090, :9091  (mgmt)    │    │
+│  │    other kafka broker pods     → :9091          (repl)   │    │
+│  │    kafka namespace pods        → :9092, :9093   (clients)│    │
+│  │    monitoring namespace pods   → :9404           (JMX)   │    │
+│  │                                → :9308           (exporter)    │
+│  │  EGRESS allowed to:                                      │    │
+│  │    other kafka broker pods     (replication)             │    │
+│  │    :443 TCP                    (kafka-init k8s API call) │    │
+│  │    :53 UDP/TCP                 (DNS)                     │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                                                                    │
+│  Schema Registry pods                                             │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  INGRESS allowed from:                                   │    │
+│  │    kafka namespace             → :8081                   │    │
+│  │    monitoring namespace        → :8081                   │    │
+│  └──────────────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────────────────────────┘
+
+┌──────── namespace: monitoring ────────────────────────────────────┐
+│                                                                    │
+│  Prometheus pods                                                  │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  INGRESS allowed from:                                   │    │
+│  │    grafana pod                 → :9090 (PromQL queries)  │    │
+│  │  EGRESS allowed to:                                      │    │
+│  │    kafka namespace             → :9404, :9308            │    │
+│  │    :53 UDP/TCP                 (DNS)                     │    │
+│  └──────────────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Component 15 — Message Flow (End-to-End)
+
+**Producer → Broker → Consumer with all components in the path:**
+
+```
+Producer Application
+  (e.g. payments service)
+       │
+       │ 1. Lookup schema
+       │    GET http://schema-registry:8081/subjects/payments.orders.created.v1-value/versions/latest
+       │    ← schema_id=1, Avro schema
+       │
+       │ 2. Serialize payload with Avro, prepend [0x00][schema_id]
+       │
+       │ 3. ProduceRequest to bootstrap: production-kafka-kafka-bootstrap:9092
+       │    Kafka client fetches cluster metadata → routes to partition leader
+       │
+       ▼
+Kafka Broker (partition leader, e.g. combined-1)
+       │
+       │ 4. Append to log: /var/kafka/data/payments.orders.created.v1-2/
+       │    Offset 1005 written
+       │
+       │ 5. Replicate to ISR followers (combined-0, combined-2) via :9091
+       │    Wait for min.insync.replicas=2 ACKs
+       │
+       │ 6. Return offset=1005 to producer
+       │
+       │ 7. JMX Exporter exposes MessagesInPerSec on :9404
+       │    Prometheus scrapes → Grafana shows "Strimzi Kafka" dashboard spike
+       │
+       ▼
+Consumer Application (payments-service-group)
+       │
+       │ 8. FetchRequest(partition=2, offset=1005)
+       │    ← message bytes
+       │
+       │ 9. Extract schema_id from first 5 bytes
+       │    GET http://schema-registry:8081/schemas/ids/1
+       │    ← Avro schema (cached after first call)
+       │
+       │ 10. Deserialize Avro payload
+       │
+       │ 11. CommitOffset(group=payments-service-group, partition=2, offset=1005)
+       │     Stored in __consumer_offsets topic
+       │
+       │ 12. Kafka Exporter detects committed_offset == end_offset
+       │     kafka_consumergroup_lag → 0
+       │     Grafana "Kafka Exporter" dashboard: lag drops to 0
+       ▼
+Business logic processes event
+```
+
+---
+
 ## Table of Contents
 
 1. [Prerequisites](#1-prerequisites)
