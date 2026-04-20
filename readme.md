@@ -2,7 +2,259 @@
 
 ## Overview
 
-This repository documents the end-to-end setup of Apache Kafka on Kubernetes using **Strimzi Operator**, with production-grade observability via **Prometheus** and **Grafana**. It covers cluster bootstrapping, topic/user management, TLS security, schema registry, Connect, and alerting.
+This repository documents the end-to-end setup of Apache Kafka on Kubernetes using **Strimzi Operator v0.44.0**, with production-grade observability via **Prometheus** and **Grafana**. It covers cluster bootstrapping, topic/user management, TLS security, schema registry, Connect, and alerting — fully tested on **k3d (k3s in Docker)** adapted for local development, with notes on production differences.
+
+---
+
+## Current Deployment Status
+
+> Last verified: 2026-04-19
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Strimzi Operator v0.44.0 | ✅ Running | Helm, namespace `kafka` |
+| Kafka Cluster (KRaft, 3 nodes) | ✅ Ready | Kafka 3.7.0, combined controller+broker |
+| Entity Operator | ✅ Running | Topic + User operators |
+| KafkaTopics | ✅ Created | `payments.orders.created.v1` (6p), `inventory.products.updated.v1` (3p) |
+| KafkaUsers | ✅ Created | `payments-service`, `inventory-service` (TLS auth + ACLs) |
+| Kafka Connect | ✅ Running | Plain bootstrap, JsonConverter |
+| Schema Registry | ✅ Running | Confluent 7.6.0, plain 9092 |
+| Kafka Exporter | ✅ Scraping | Consumer lag metrics on `:9308` |
+| Prometheus | ✅ Running | kube-prometheus-stack v58.0.0 |
+| Grafana | ✅ Running | 4 Strimzi dashboards loaded |
+| AlertManager | ✅ Running | 7 PrometheusRules applied |
+| Network Policies | ✅ Applied | kafka + monitoring namespaces |
+
+### End-to-End Test Results
+
+```
+=== Topic Message Counts ===
+  payments.orders.created.v1:    3,005 messages (6 partitions)
+  inventory.products.updated.v1:   500 messages (3 partitions)
+
+=== Consumer Group Lag (Prometheus-scraped) ===
+  payments-service-group / payments.orders.created.v1  → lag = 2,000  (deliberate, showing in Grafana)
+  inventory-service-group / inventory.products.updated.v1 → lag = 0   (fully consumed)
+  check-group / payments.orders.created.v1             → lag = 3,000  (only consumed 5 msgs)
+
+=== Grafana Dashboards (auto-loaded via sidecar) ===
+  ✅ Strimzi Kafka
+  ✅ Strimzi Kafka Exporter
+  ✅ Strimzi Kafka Connect
+  ✅ Strimzi Operators
+```
+
+---
+
+## Known Issues & Solutions
+
+These are real issues encountered during implementation, with the root cause and fix for each.
+
+### Issue 1 — k3s v1.33 incompatible with Strimzi 0.44
+
+**Symptom:**
+```
+UnrecognizedPropertyException: Unrecognized field "emulationMajor" (class
+io.fabric8.kubernetes.api.model.version.Info)
+```
+Strimzi operator pod enters `CrashLoopBackOff` immediately after install.
+
+**Root cause:** k3s v1.33 adds an `emulationMajor` field to the `/version` API response. Strimzi 0.44 uses fabric8 6.13.4, which fails strict JSON deserialization on unknown fields.
+
+**Fix:** Create the k3d cluster pinned to k3s v1.31.6:
+```bash
+k3d cluster create kafka-local \
+  --image rancher/k3s:v1.31.6-k3s1 \
+  --servers 1 --agents 3 \
+  -p "30092:30092@loadbalancer"
+```
+
+---
+
+### Issue 2 — `watchNamespaces` duplicates kafka namespace
+
+**Symptom:** Operator logs show `watching kafka,kafka` — the kafka namespace is listed twice, causing reconciliation noise.
+
+**Root cause:** When Strimzi is installed into the `kafka` namespace, it automatically watches that namespace. Setting `--set watchNamespaces="{kafka}"` additionally adds it, resulting in a duplicate.
+
+**Fix:** Omit the `watchNamespaces` flag entirely when operator and Kafka are in the same namespace:
+```bash
+helm install strimzi-kafka-operator strimzi/strimzi-kafka-operator \
+  --namespace kafka \
+  --version 0.44.0
+```
+
+---
+
+### Issue 3 — `storageClassName: hostpath` not found in k3d
+
+**Symptom:**
+```
+no persistent volumes available for this claim and no storage class is set
+```
+Prometheus PVCs remain `Pending`.
+
+**Root cause:** k3d uses the `rancher.io/local-path` provisioner, which creates a StorageClass named `local-path` — not `hostpath` (which is Docker Desktop's class).
+
+**Fix:** Use `local-path` in `prometheus-values.yaml`:
+```yaml
+prometheus:
+  prometheusSpec:
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path   # not hostpath
+          resources:
+            requests:
+              storage: 5Gi
+```
+
+---
+
+### Issue 4 — `verify-cluster.sh` exits immediately on first success
+
+**Symptom:** Script exits after the first `[OK]` check — all subsequent checks never run.
+
+**Root cause:** `set -euo pipefail` is active. The arithmetic expression `((PASS++))` evaluates to `0` when `PASS` starts at `0`, which bash treats as a false/failure exit code (`1`), causing the shell to exit.
+
+**Fix:** Use assignment arithmetic instead:
+```bash
+# Wrong — exits when PASS==0
+((PASS++))
+
+# Correct — always exits 0
+PASS=$((PASS + 1))
+FAIL=$((FAIL + 1))
+```
+
+---
+
+### Issue 5 — Schema Registry `CrashLoopBackOff`
+
+**Symptom:**
+```
+org.apache.kafka.common.config.ConfigException:
+  Invalid value tcp://10.96.x.x:8081 for configuration bootstrap.servers
+```
+
+**Root cause:** Kubernetes auto-injects service discovery environment variables for every service in the namespace. Because there is a Service named `schema-registry` on port 8081, Kubernetes injects `SCHEMA_REGISTRY_PORT=tcp://10.96.x.x:8081`. Confluent's config parser treats every `SCHEMA_REGISTRY_*` env var as a config key and fails to parse the `tcp://` value as a bootstrap address.
+
+**Fix:** Set `enableServiceLinks: false` in the pod spec to suppress Kubernetes service env injection:
+```yaml
+spec:
+  enableServiceLinks: false   # prevents SCHEMA_REGISTRY_PORT=tcp://... injection
+  containers:
+    - name: schema-registry
+      image: confluentinc/cp-schema-registry:7.6.0
+```
+
+---
+
+### Issue 6 — `kafka-init` ClosedChannelException with NodePort external listener
+
+**Symptom:**
+```
+io.netty.channel.ClosedChannelException: null
+kafka-init container fails, broker pod stuck in Init:0/1
+```
+
+**Root cause:** When an external NodePort listener is configured, Strimzi's `kafka-init` container queries the Kubernetes API to resolve the node's external address for advertising. On k3d, the node's external IP is unreachable from inside the cluster, and the init container cannot complete. Even with RBAC fixes, the underlying network path doesn't resolve correctly.
+
+**Fix:** Remove the external NodePort listener entirely from the Kafka CR. Internal-only listeners (`plain` on 9092, `tls` on 9093) are sufficient for local dev:
+```yaml
+spec:
+  kafka:
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+        authentication:
+          type: tls
+    # No external listener — avoids kafka-init node address lookup
+```
+
+---
+
+### Issue 7 — Cruise Control triggers rolling restart deadlock
+
+**Symptom:** After adding `cruiseControl:` to the Kafka CR, the operator attempts a rolling restart. `pod-0`'s init container fails because the StrimziPodSet still carries `EXTERNAL_ADDRESS=TRUE` from the previous spec. The operator waits for `pod-0` to become Ready before applying the new spec — deadlock.
+
+**Root cause:** Cruise Control triggers a full rolling restart when first added. Any pre-existing misconfiguration in the current pod spec (e.g. stale external listener env var) blocks the rolling update from completing.
+
+**Fix:** Do not add Cruise Control to an already-running cluster without first ensuring the existing spec is clean. For local dev, omit Cruise Control entirely:
+```yaml
+spec:
+  kafka: ...
+  entityOperator: ...
+  # No cruiseControl section for local dev
+```
+If a deadlock occurs, break it by force-deleting blocked pods after manually patching the StrimziPodSet — but it is safer to delete and recreate the cluster.
+
+---
+
+### Issue 8 — Network policy blocks Prometheus from scraping Kafka Exporter (port 9308)
+
+**Symptom:** Prometheus target `http://<kafka-exporter-pod-ip>:9308/metrics` shows `State: down`, error `connection refused`.
+
+**Root cause (two policies):**
+
+1. **`kafka-broker-network-policy`** — ingress from `monitoring` namespace only allowed on port `9404` (JMX exporter). Kafka Exporter listens on `9308`, which was not in the allow list.
+2. **`prometheus-network-policy`** — egress from Prometheus to `kafka` namespace only allowed on port `9404`. Same missing port.
+
+**Fix:** Add port `9308` to both policies:
+
+`network-policies/kafka-network-policy.yaml`:
+```yaml
+- from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+  ports:
+    - port: 9404
+    - port: 9308   # Kafka Exporter
+```
+
+`network-policies/monitoring-network-policy.yaml`:
+```yaml
+egress:
+  - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kafka
+    ports:
+      - port: 9404
+      - port: 9308   # Kafka Exporter
+```
+
+---
+
+### Issue 9 — Grafana dashboard ConfigMaps not created (Python `yaml` module missing)
+
+**Symptom:**
+```
+ModuleNotFoundError: No module named 'yaml'
+```
+Attempt to generate dashboard ConfigMaps using a Python script failed.
+
+**Root cause:** The host system had Python 3.14 installed but `PyYAML` was not installed via `pip`.
+
+**Fix:** Use `kubectl create configmap --dry-run=client -o yaml` with `sed` to inject the sidecar label, bypassing Python entirely:
+```bash
+for name in strimzi-kafka strimzi-kafka-exporter strimzi-kafka-connect strimzi-operators; do
+  kubectl create configmap "grafana-dashboard-${name}" \
+    --from-file="${name}.json=monitoring/grafana/dashboards/${name}.json" \
+    --namespace monitoring \
+    --dry-run=client -o yaml | \
+    sed 's/^  namespace: monitoring$/  namespace: monitoring\n  labels:\n    grafana_dashboard: "1"/' \
+    > "monitoring/grafana/dashboards/${name}-configmap.yaml"
+  kubectl apply -f "monitoring/grafana/dashboards/${name}-configmap.yaml"
+done
+```
 
 ---
 
@@ -10,21 +262,25 @@ This repository documents the end-to-end setup of Apache Kafka on Kubernetes usi
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Kubernetes Cluster                       │
+│                    k3d Kubernetes Cluster                       │
+│   (k3s v1.31.6 — 1 server + 3 agent nodes)                    │
 │                                                                 │
-│  ┌──────────────┐   ┌──────────────┐   ┌────────────────────┐  │
-│  │   Strimzi    │   │    Kafka     │   │    ZooKeeper /     │  │
-│  │   Operator   │──▶│   Brokers   │   │  KRaft (3 nodes)   │  │
-│  └──────────────┘   └──────┬───────┘   └────────────────────┘  │
-│                            │                                    │
-│  ┌──────────────────────────▼──────────────────────────────┐   │
-│  │                   Kafka Ecosystem                        │   │
-│  │  Kafka Connect │ Schema Registry │ Kafka Bridge │ MM2   │   │
-│  └──────────────────────────┬────────────────────────────────┘  │
-│                             │                                   │
-│  ┌──────────────────────────▼──────────────────────────────┐   │
-│  │                 Observability Stack                      │   │
-│  │  JMX Exporter → Prometheus → Grafana │ AlertManager     │   │
+│  namespace: kafka                                               │
+│  ┌──────────────┐   ┌────────────────────────────────────────┐ │
+│  │   Strimzi    │   │  KafkaNodePool: combined (x3)          │ │
+│  │   Operator   │──▶│  roles: [controller, broker]           │ │
+│  └──────────────┘   │  Kafka 3.7.0, KRaft mode               │ │
+│                     └──────────┬───────────────────────────── ┘ │
+│                                │ bootstrap:9092 (plain)         │
+│  ┌─────────────────────────────▼───────────────────────────┐   │
+│  │ Kafka Ecosystem (namespace: kafka)                       │   │
+│  │  Kafka Connect │ Schema Registry │ Kafka Exporter:9308  │   │
+│  └─────────────────────────────┬───────────────────────────┘   │
+│                                │ JMX:9404  Exporter:9308        │
+│  ┌─────────────────────────────▼───────────────────────────┐   │
+│  │ Observability Stack (namespace: monitoring)              │   │
+│  │  Prometheus (scrapes 9404 + 9308) → Grafana (4 boards)  │   │
+│  │  AlertManager (7 rules)                                  │   │
 │  └─────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -64,11 +320,24 @@ This repository documents the end-to-end setup of Apache Kafka on Kubernetes usi
 |------|---------|---------|
 | `kubectl` | >= 1.27 | Kubernetes CLI |
 | `helm` | >= 3.12 | Package manager |
-| `kustomize` | >= 5.0 | Manifest management |
-| `kafkacat` / `kcat` | latest | Kafka CLI testing |
+| `k3d` | >= 5.6 | Local k3s cluster (dev) |
 | `openssl` | >= 3.0 | TLS certificate generation |
 
-### Kubernetes Requirements
+### Local Dev Cluster (k3d)
+
+```bash
+# Create cluster with k3s v1.31.6 (required — v1.33 breaks Strimzi 0.44)
+k3d cluster create kafka-local \
+  --image rancher/k3s:v1.31.6-k3s1 \
+  --servers 1 --agents 3 \
+  -p "30092:30092@loadbalancer"
+
+kubectl cluster-info
+```
+
+> **Warning:** Do NOT use k3s v1.33+. The `emulationMajor` field in its `/version` response causes Strimzi's fabric8 client to crash. See [Issue 1](#issue-1--k3s-v133-incompatible-with-strimzi-044).
+
+### Production Kubernetes Requirements
 
 - Kubernetes >= 1.27 (EKS / GKE / AKS / on-prem)
 - Minimum node specs for production brokers: **4 vCPU, 16 GB RAM, 500 GB SSD**
@@ -80,7 +349,8 @@ This repository documents the end-to-end setup of Apache Kafka on Kubernetes usi
 ```bash
 kubectl create namespace kafka
 kubectl create namespace monitoring
-kubectl label namespace kafka strimzi.io/cluster=true
+kubectl label namespace kafka kubernetes.io/metadata.name=kafka
+kubectl label namespace monitoring kubernetes.io/metadata.name=monitoring
 ```
 
 ---
@@ -90,244 +360,85 @@ kubectl label namespace kafka strimzi.io/cluster=true
 ```
 .
 ├── strimzi/
-│   ├── operator/
-│   │   └── strimzi-operator.yaml        # CRDs + Operator deployment
 │   ├── cluster/
-│   │   ├── kafka-cluster.yaml           # Main Kafka cluster CR
-│   │   ├── kafka-cluster-kraft.yaml     # KRaft-mode variant
-│   │   └── node-pool.yaml               # KafkaNodePool CR
+│   │   ├── kafka-cluster.yaml           # Kafka CR (KRaft, internal listeners only)
+│   │   └── node-pool.yaml               # KafkaNodePool (combined controller+broker)
 │   ├── topics/
-│   │   ├── kafka-topic-template.yaml
-│   │   └── topics/                      # Per-topic CR files
+│   │   ├── orders-events.yaml           # payments.orders.created.v1 (6 partitions)
+│   │   └── inventory-updates.yaml       # inventory.products.updated.v1 (3 partitions)
 │   ├── users/
-│   │   └── kafka-user.yaml              # KafkaUser CRs with ACLs
+│   │   ├── payments-service.yaml        # TLS auth, Write+Read ACL on payments topic
+│   │   └── inventory-service.yaml       # TLS auth, Write ACL on inventory topic
 │   ├── connect/
-│   │   ├── kafka-connect.yaml
-│   │   └── connectors/
-│   ├── mirror-maker/
-│   │   └── kafka-mirror-maker2.yaml
+│   │   └── kafka-connect.yaml           # KafkaConnect (plain 9092, JsonConverter)
 │   └── schema-registry/
-│       └── schema-registry.yaml
+│       └── schema-registry.yaml         # Confluent Schema Registry 7.6.0
 ├── monitoring/
 │   ├── prometheus/
-│   │   ├── prometheus-operator.yaml
-│   │   ├── prometheus.yaml
-│   │   ├── servicemonitor-kafka.yaml
+│   │   ├── prometheus-values.yaml       # Helm values (local-path StorageClass)
+│   │   ├── kafka-metrics-configmap.yaml # JMX exporter rules
+│   │   ├── servicemonitor-kafka.yaml    # ServiceMonitors for Kafka + Connect
 │   │   └── rules/
-│   │       └── kafka-alerts.yaml
+│   │       └── kafka-alerts.yaml        # 7 PrometheusRules
 │   ├── grafana/
-│   │   ├── grafana.yaml
-│   │   ├── datasource-prometheus.yaml
+│   │   ├── datasource-prometheus.yaml   # Prometheus datasource ConfigMap
 │   │   └── dashboards/
-│   │       ├── kafka-overview.json
-│   │       ├── kafka-topics.json
-│   │       ├── kafka-consumer-lag.json
-│   │       └── zookeeper.json
+│   │       ├── strimzi-kafka.json            # Official Strimzi dashboard
+│   │       ├── strimzi-kafka-exporter.json   # Consumer lag dashboard
+│   │       ├── strimzi-kafka-connect.json    # Connect dashboard
+│   │       ├── strimzi-operators.json        # Operator metrics dashboard
+│   │       ├── strimzi-kafka-configmap.yaml
+│   │       ├── strimzi-kafka-exporter-configmap.yaml
+│   │       ├── strimzi-kafka-connect-configmap.yaml
+│   │       └── strimzi-operators-configmap.yaml
+│   ├── kafka-exporter/
+│   │   └── kafka-exporter.yaml          # Deployment + Service + ServiceMonitor
 │   └── alertmanager/
-│       ├── alertmanager.yaml
 │       └── alertmanager-config.yaml
-├── storage/
-│   └── storageclass.yaml
 ├── network-policies/
-│   ├── kafka-network-policy.yaml
-│   └── monitoring-network-policy.yaml
+│   ├── kafka-network-policy.yaml        # Ports: 9090,9091,9092,9093,9404,9308
+│   └── monitoring-network-policy.yaml   # Prometheus egress: 9404,9308
 └── scripts/
-    ├── install.sh
-    ├── verify-cluster.sh
-    └── generate-certs.sh
+    ├── install.sh                       # Full one-shot install script
+    └── verify-cluster.sh                # 17-check health script
 ```
 
 ---
 
 ## 3. Strimzi Operator Installation
 
-### Option A: Helm (Recommended)
-
 ```bash
 helm repo add strimzi https://strimzi.io/charts/
 helm repo update
 
+# Do NOT set watchNamespaces when operator and kafka share the same namespace
 helm install strimzi-kafka-operator strimzi/strimzi-kafka-operator \
   --namespace kafka \
-  --set watchNamespaces="{kafka}" \
-  --set resources.requests.memory=512Mi \
-  --set resources.requests.cpu=200m \
-  --set resources.limits.memory=1Gi \
-  --set resources.limits.cpu=1000m \
-  --version 0.44.0
+  --version 0.44.0 \
+  --wait --timeout 5m
 ```
 
-### Option B: YAML Manifests
+> **Note:** Omit `--set watchNamespaces="{kafka}"` — Strimzi already watches its own namespace. Adding it explicitly creates a duplicate entry. See [Issue 2](#issue-2--watchnamespaces-duplicates-kafka-namespace).
+
+### Verify
 
 ```bash
-# Install CRDs and operator
-kubectl apply -f "https://strimzi.io/install/latest?namespace=kafka" -n kafka
-
-# Verify operator is running
-kubectl wait --for=condition=ready pod -l name=strimzi-cluster-operator \
-  -n kafka --timeout=120s
-```
-
-### Verify Installation
-
-```bash
-kubectl get pods -n kafka
-kubectl get crds | grep kafka
-# Expected CRDs: kafkas, kafkatopics, kafkausers, kafkaconnects,
-#                kafkamirrormaker2s, kafkabridges, kafkanodepools
+kubectl get pods -n kafka -l name=strimzi-cluster-operator
+kubectl get crds | grep strimzi
+# Expected: kafkas, kafkatopics, kafkausers, kafkaconnects, kafkanodepools, ...
 ```
 
 ---
 
 ## 4. Kafka Cluster Deployment
 
-### `strimzi/cluster/kafka-cluster.yaml`
-
-```yaml
-apiVersion: kafka.strimzi.io/v1beta2
-kind: Kafka
-metadata:
-  name: production-kafka
-  namespace: kafka
-spec:
-  kafka:
-    version: 3.7.0
-    replicas: 3
-    listeners:
-      - name: plain
-        port: 9092
-        type: internal
-        tls: false
-      - name: tls
-        port: 9093
-        type: internal
-        tls: true
-        authentication:
-          type: tls
-      - name: external
-        port: 9094
-        type: loadbalancer
-        tls: true
-        authentication:
-          type: tls
-    config:
-      offsets.topic.replication.factor: 3
-      transaction.state.log.replication.factor: 3
-      transaction.state.log.min.isr: 2
-      default.replication.factor: 3
-      min.insync.replicas: 2
-      log.message.format.version: "3.7"
-      inter.broker.protocol.version: "3.7"
-      log.retention.hours: 168
-      log.segment.bytes: 1073741824
-      log.retention.check.interval.ms: 300000
-      num.network.threads: 8
-      num.io.threads: 16
-      socket.send.buffer.bytes: 102400
-      socket.receive.buffer.bytes: 102400
-      socket.request.max.bytes: 104857600
-    storage:
-      type: jbod
-      volumes:
-        - id: 0
-          type: persistent-claim
-          size: 500Gi
-          class: kafka-storage
-          deleteClaim: false
-    resources:
-      requests:
-        memory: 8Gi
-        cpu: "2"
-      limits:
-        memory: 16Gi
-        cpu: "4"
-    jvmOptions:
-      -Xms: 4096m
-      -Xmx: 4096m
-      gcLoggingEnabled: false
-    metricsConfig:
-      type: jmxPrometheusExporter
-      valueFrom:
-        configMapKeyRef:
-          name: kafka-metrics-config
-          key: kafka-metrics-config.yml
-    template:
-      pod:
-        tolerations:
-          - key: "kafka-broker"
-            operator: "Exists"
-            effect: "NoSchedule"
-        affinity:
-          podAntiAffinity:
-            requiredDuringSchedulingIgnoredDuringExecution:
-              - labelSelector:
-                  matchExpressions:
-                    - key: strimzi.io/name
-                      operator: In
-                      values:
-                        - production-kafka-kafka
-                topologyKey: kubernetes.io/hostname
-  zookeeper:
-    replicas: 3
-    storage:
-      type: persistent-claim
-      size: 100Gi
-      class: kafka-storage
-      deleteClaim: false
-    resources:
-      requests:
-        memory: 2Gi
-        cpu: "500m"
-      limits:
-        memory: 4Gi
-        cpu: "1"
-    metricsConfig:
-      type: jmxPrometheusExporter
-      valueFrom:
-        configMapKeyRef:
-          name: kafka-metrics-config
-          key: zookeeper-metrics-config.yml
-  entityOperator:
-    topicOperator:
-      resources:
-        requests:
-          memory: 512Mi
-          cpu: 200m
-        limits:
-          memory: 1Gi
-          cpu: 500m
-    userOperator:
-      resources:
-        requests:
-          memory: 512Mi
-          cpu: 200m
-        limits:
-          memory: 1Gi
-          cpu: 500m
-```
-
-```bash
-kubectl apply -f strimzi/cluster/kafka-cluster.yaml -n kafka
-
-# Monitor rollout
-kubectl wait kafka/production-kafka --for=condition=Ready \
-  --timeout=600s -n kafka
-```
-
----
-
-## 5. KRaft Mode (ZooKeeper-less)
-
-For Kafka 3.7+ production deployments, prefer KRaft mode (removes ZooKeeper dependency).
-
 ### `strimzi/cluster/node-pool.yaml`
 
 ```yaml
-# Controller pool
 apiVersion: kafka.strimzi.io/v1beta2
 kind: KafkaNodePool
 metadata:
-  name: controller
+  name: combined
   namespace: kafka
   labels:
     strimzi.io/cluster: production-kafka
@@ -335,49 +446,25 @@ spec:
   replicas: 3
   roles:
     - controller
-  storage:
-    type: persistent-claim
-    size: 100Gi
-    class: kafka-storage
-    deleteClaim: false
-  resources:
-    requests:
-      memory: 4Gi
-      cpu: "1"
-    limits:
-      memory: 8Gi
-      cpu: "2"
----
-# Broker pool
-apiVersion: kafka.strimzi.io/v1beta2
-kind: KafkaNodePool
-metadata:
-  name: broker
-  namespace: kafka
-  labels:
-    strimzi.io/cluster: production-kafka
-spec:
-  replicas: 3
-  roles:
     - broker
   storage:
     type: jbod
     volumes:
       - id: 0
         type: persistent-claim
-        size: 500Gi
-        class: kafka-storage
+        size: 10Gi
+        class: local-path   # k3d StorageClass (use kafka-storage / gp3 in prod)
         deleteClaim: false
   resources:
     requests:
-      memory: 8Gi
-      cpu: "2"
+      memory: 1Gi
+      cpu: 250m
     limits:
-      memory: 16Gi
-      cpu: "4"
+      memory: 2Gi
+      cpu: "1"
 ```
 
-### `strimzi/cluster/kafka-cluster-kraft.yaml`
+### `strimzi/cluster/kafka-cluster.yaml`
 
 ```yaml
 apiVersion: kafka.strimzi.io/v1beta2
@@ -393,34 +480,98 @@ spec:
     version: 3.7.0
     metadataVersion: 3.7-IV4
     listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
       - name: tls
         port: 9093
         type: internal
         tls: true
         authentication:
           type: tls
-      - name: external
-        port: 9094
-        type: loadbalancer
-        tls: true
+      # No external listener — avoids kafka-init node-address lookup failure on k3d
     config:
       offsets.topic.replication.factor: 3
       transaction.state.log.replication.factor: 3
       transaction.state.log.min.isr: 2
       default.replication.factor: 3
       min.insync.replicas: 2
-    storage:
-      type: jbod
-      volumes:
-        - id: 0
-          type: persistent-claim
-          size: 500Gi
-          class: kafka-storage
-          deleteClaim: false
-  # No zookeeper section in KRaft mode
+      log.retention.hours: 24
+      num.network.threads: 3
+      num.io.threads: 8
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: kafka-metrics-config
+          key: kafka-metrics-config.yml
+    template:
+      pod:
+        affinity:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  labelSelector:
+                    matchExpressions:
+                      - key: strimzi.io/name
+                        operator: In
+                        values:
+                          - production-kafka-combined
+                  topologyKey: kubernetes.io/hostname
   entityOperator:
     topicOperator: {}
     userOperator: {}
+```
+
+```bash
+kubectl apply -f strimzi/cluster/
+kubectl wait kafka/production-kafka --for=condition=Ready \
+  --timeout=600s -n kafka
+```
+
+---
+
+## 5. KRaft Mode (ZooKeeper-less)
+
+KRaft is enabled via two annotations on the Kafka CR:
+
+```yaml
+metadata:
+  annotations:
+    strimzi.io/node-pools: enabled
+    strimzi.io/kraft: enabled
+```
+
+The `KafkaNodePool` with `roles: [controller, broker]` creates combined nodes (suitable for local dev). In production, separate controller and broker pools are recommended:
+
+```yaml
+# Controller-only pool (3 replicas, smaller storage)
+---
+kind: KafkaNodePool
+metadata:
+  name: controller
+spec:
+  roles: [controller]
+  replicas: 3
+  storage:
+    size: 20Gi
+
+# Broker-only pool (scale independently)
+---
+kind: KafkaNodePool
+metadata:
+  name: broker
+spec:
+  roles: [broker]
+  replicas: 3
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        size: 500Gi
+        class: kafka-storage
 ```
 
 ---
@@ -429,19 +580,14 @@ spec:
 
 ### Mutual TLS (mTLS) — Client Certificate Auth
 
-Strimzi automatically generates a cluster CA. Extract the CA cert for clients:
+Strimzi automatically generates a cluster CA. Extract for clients:
 
 ```bash
-# Get cluster CA certificate
 kubectl get secret production-kafka-cluster-ca-cert \
   -n kafka -o jsonpath='{.data.ca\.crt}' | base64 -d > ca.crt
-
-# Get cluster CA key (for signing client certs manually)
-kubectl get secret production-kafka-cluster-ca \
-  -n kafka -o jsonpath='{.data.ca\.key}' | base64 -d > ca.key
 ```
 
-### SCRAM-SHA-512 Authentication (alternative)
+### SCRAM-SHA-512 Authentication
 
 ```yaml
 listeners:
@@ -472,22 +618,23 @@ listeners:
 
 ## 7. Topic Management
 
-### `strimzi/topics/kafka-topic-template.yaml`
+**Naming convention:** `<domain>.<entity>.<event-type>.<version>`
+
+### `strimzi/topics/orders-events.yaml`
 
 ```yaml
 apiVersion: kafka.strimzi.io/v1beta2
 kind: KafkaTopic
 metadata:
-  name: orders-events
+  name: payments.orders.created.v1
   namespace: kafka
   labels:
     strimzi.io/cluster: production-kafka
 spec:
-  partitions: 12
+  partitions: 6
   replicas: 3
   config:
-    retention.ms: "604800000"        # 7 days
-    segment.bytes: "1073741824"      # 1 GiB segments
+    retention.ms: "86400000"       # 24 hours (local dev)
     min.insync.replicas: "2"
     compression.type: lz4
     cleanup.policy: delete
@@ -495,24 +642,14 @@ spec:
 
 ```bash
 kubectl apply -f strimzi/topics/
-
-# Verify topics
 kubectl get kafkatopics -n kafka
-```
-
-**Topic Naming Convention:**
-
-```
-<domain>.<entity>.<event-type>.<version>
-# e.g.: payments.orders.created.v1
-#       inventory.products.updated.v2
 ```
 
 ---
 
 ## 8. User Management (ACLs)
 
-### `strimzi/users/kafka-user.yaml`
+### `strimzi/users/payments-service.yaml`
 
 ```yaml
 apiVersion: kafka.strimzi.io/v1beta2
@@ -528,36 +665,23 @@ spec:
   authorization:
     type: simple
     acls:
-      # Producer ACL
       - resource:
           type: topic
           name: payments.orders.created.v1
           patternType: literal
-        operations: [Write, Describe]
-        host: "*"
-      # Consumer ACL
-      - resource:
-          type: topic
-          name: payments.orders.created.v1
-          patternType: literal
-        operations: [Read, Describe]
-        host: "*"
+        operations: [Write, Read, Describe]
       - resource:
           type: group
           name: payments-service-group
           patternType: literal
         operations: [Read]
-        host: "*"
 ```
 
 ```bash
-kubectl apply -f strimzi/users/kafka-user.yaml -n kafka
-
-# Extract user certificate and key for application config
+kubectl apply -f strimzi/users/
+# Extract user cert for application config
 kubectl get secret payments-service -n kafka \
   -o jsonpath='{.data.user\.crt}' | base64 -d > user.crt
-kubectl get secret payments-service -n kafka \
-  -o jsonpath='{.data.user\.key}' | base64 -d > user.key
 ```
 
 ---
@@ -576,62 +700,26 @@ metadata:
     strimzi.io/use-connector-resources: "true"
 spec:
   version: 3.7.0
-  replicas: 3
-  bootstrapServers: production-kafka-kafka-bootstrap:9093
-  tls:
-    trustedCertificates:
-      - secretName: production-kafka-cluster-ca-cert
-        certificate: ca.crt
-  authentication:
-    type: tls
-    certificateAndKey:
-      secretName: connect-user
-      certificate: user.crt
-      key: user.key
+  replicas: 1
+  bootstrapServers: production-kafka-kafka-bootstrap:9092
   config:
     group.id: connect-cluster
     offset.storage.topic: connect-offsets
     config.storage.topic: connect-configs
     status.storage.topic: connect-status
-    config.storage.replication.factor: 3
-    offset.storage.replication.factor: 3
-    status.storage.replication.factor: 3
+    config.storage.replication.factor: 1
+    offset.storage.replication.factor: 1
+    status.storage.replication.factor: 1
     key.converter: org.apache.kafka.connect.storage.StringConverter
-    value.converter: io.confluent.connect.avro.AvroConverter
-    value.converter.schema.registry.url: http://schema-registry:8081
-  build:
-    output:
-      type: docker
-      image: your-registry/kafka-connect:latest
-    plugins:
-      - name: debezium-postgres
-        artifacts:
-          - type: tgz
-            url: https://repo1.maven.org/maven2/io/debezium/debezium-connector-postgres/2.6.0.Final/debezium-connector-postgres-2.6.0.Final-plugin.tar.gz
-      - name: kafka-connect-s3
-        artifacts:
-          - type: jar
-            url: https://packages.confluent.io/maven/io/confluent/kafka-connect-s3/10.5.0/kafka-connect-s3-10.5.0.jar
-  resources:
-    requests:
-      memory: 2Gi
-      cpu: "1"
-    limits:
-      memory: 4Gi
-      cpu: "2"
-  metricsConfig:
-    type: jmxPrometheusExporter
-    valueFrom:
-      configMapKeyRef:
-        name: kafka-metrics-config
-        key: connect-metrics-config.yml
+    value.converter: org.apache.kafka.connect.json.JsonConverter
+    value.converter.schemas.enable: "false"
 ```
 
 ---
 
 ## 10. Schema Registry
 
-Deploy Confluent Schema Registry (or Apicurio) alongside Kafka.
+> **Critical:** Set `enableServiceLinks: false` or the pod will crash. See [Issue 5](#issue-5--schema-registry-crashloopbackoff).
 
 ### `strimzi/schema-registry/schema-registry.yaml`
 
@@ -642,7 +730,7 @@ metadata:
   name: schema-registry
   namespace: kafka
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: schema-registry
@@ -651,6 +739,7 @@ spec:
       labels:
         app: schema-registry
     spec:
+      enableServiceLinks: false   # prevents SCHEMA_REGISTRY_PORT=tcp://... injection
       containers:
         - name: schema-registry
           image: confluentinc/cp-schema-registry:7.6.0
@@ -662,39 +751,24 @@ spec:
                 fieldRef:
                   fieldPath: status.podIP
             - name: SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS
-              value: "production-kafka-kafka-bootstrap:9093"
+              value: "production-kafka-kafka-bootstrap:9092"
             - name: SCHEMA_REGISTRY_KAFKASTORE_SECURITY_PROTOCOL
-              value: SSL
-            - name: SCHEMA_REGISTRY_KAFKASTORE_SSL_TRUSTSTORE_LOCATION
-              value: /etc/schema-registry/secrets/truststore.jks
+              value: PLAINTEXT
             - name: SCHEMA_REGISTRY_LISTENERS
               value: "http://0.0.0.0:8081"
-          resources:
-            requests:
-              memory: 1Gi
-              cpu: 500m
-            limits:
-              memory: 2Gi
-              cpu: "1"
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: schema-registry
-  namespace: kafka
-spec:
-  selector:
-    app: schema-registry
-  ports:
-    - port: 8081
-      targetPort: 8081
+```
+
+### Test Schema Registry
+
+```bash
+kubectl port-forward svc/schema-registry 8081:8081 -n kafka
+curl http://localhost:8081/subjects
+# Expected: []
 ```
 
 ---
 
 ## 11. MirrorMaker 2 (Multi-cluster Replication)
-
-### `strimzi/mirror-maker/kafka-mirror-maker2.yaml`
 
 ```yaml
 apiVersion: kafka.strimzi.io/v1beta2
@@ -713,148 +787,74 @@ spec:
         trustedCertificates:
           - secretName: source-cluster-ca-cert
             certificate: ca.crt
-      authentication:
-        type: tls
-        certificateAndKey:
-          secretName: mirror-maker-source-user
-          certificate: user.crt
-          key: user.key
     - alias: "target-cluster"
       bootstrapServers: production-kafka-kafka-bootstrap:9093
       tls:
         trustedCertificates:
           - secretName: production-kafka-cluster-ca-cert
             certificate: ca.crt
-      authentication:
-        type: tls
-        certificateAndKey:
-          secretName: mirror-maker-target-user
-          certificate: user.crt
-          key: user.key
   mirrors:
     - sourceCluster: "source-cluster"
       targetCluster: "target-cluster"
       sourceConnector:
         config:
           replication.factor: 3
-          offset-syncs.topic.replication.factor: 3
           sync.topic.acls.enabled: "false"
-          replication.policy.separator: "."
-          replication.policy.class: "org.apache.kafka.connect.mirror.IdentityReplicationPolicy"
-      heartbeatConnector:
-        config:
-          heartbeats.topic.replication.factor: 3
-      checkpointConnector:
-        config:
-          checkpoints.topic.replication.factor: 3
-          sync.group.offsets.enabled: "true"
       topicsPattern: ".*"
       groupsPattern: ".*"
-  resources:
-    requests:
-      memory: 2Gi
-      cpu: "1"
-    limits:
-      memory: 4Gi
-      cpu: "2"
 ```
 
 ---
 
 ## 12. Prometheus Integration
 
-### JMX Exporter ConfigMap
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: kafka-metrics-config
-  namespace: kafka
-data:
-  kafka-metrics-config.yml: |
-    lowercaseOutputName: true
-    rules:
-      - pattern: kafka.server<type=(.+), name=(.+), clientId=(.+), topic=(.+), partition=(.*)><>Value
-        name: kafka_server_$1_$2
-        type: GAUGE
-        labels:
-          clientId: "$3"
-          topic: "$4"
-          partition: "$5"
-      - pattern: kafka.server<type=(.+), name=(.+), clientId=(.+), brokerHost=(.+), brokerPort=(.+)><>Value
-        name: kafka_server_$1_$2
-        type: GAUGE
-        labels:
-          clientId: "$3"
-          broker: "$4:$5"
-      - pattern: kafka.server<type=(.+), name=(.+)><>Value
-        name: kafka_server_$1_$2
-        type: GAUGE
-      - pattern: kafka.(\w+)<type=(.+), name=(.+)><>Value
-        name: kafka_$1_$2_$3
-        type: GAUGE
-      - pattern: ".*"
-```
-
-### Prometheus Operator + ServiceMonitor
+### Install kube-prometheus-stack
 
 ```bash
-# Install kube-prometheus-stack
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
 helm repo update
 
 helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
   --namespace monitoring \
-  --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
-  --set prometheus.prometheusSpec.retention=30d \
-  --set prometheus.prometheusSpec.storageSpec.volumeClaimTemplate.spec.storageClassName=standard \
-  --set prometheus.prometheusSpec.storageSpec.volumeClaimTemplate.spec.resources.requests.storage=100Gi \
-  --version 58.0.0
+  --version 58.0.0 \
+  -f monitoring/prometheus/prometheus-values.yaml \
+  --wait
 ```
 
-### `monitoring/prometheus/servicemonitor-kafka.yaml`
+Key `prometheus-values.yaml` settings for k3d:
 
 ```yaml
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: kafka-servicemonitor
-  namespace: monitoring
-  labels:
-    release: kube-prometheus-stack
-spec:
-  namespaceSelector:
-    matchNames:
-      - kafka
-  selector:
-    matchLabels:
-      strimzi.io/kind: Kafka
-  endpoints:
-    - port: tcp-prometheus
-      path: /metrics
-      interval: 30s
-      scheme: http
----
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: kafka-connect-servicemonitor
-  namespace: monitoring
-  labels:
-    release: kube-prometheus-stack
-spec:
-  namespaceSelector:
-    matchNames:
-      - kafka
-  selector:
-    matchLabels:
-      strimzi.io/kind: KafkaConnect
-  endpoints:
-    - port: tcp-prometheus
-      path: /metrics
-      interval: 30s
+prometheus:
+  prometheusSpec:
+    serviceMonitorSelectorNilUsesHelmValues: false
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path   # k3d StorageClass
+          resources:
+            requests:
+              storage: 5Gi
 ```
+
+### Kafka JMX Exporter ConfigMap
+
+```bash
+kubectl apply -f monitoring/prometheus/kafka-metrics-configmap.yaml -n kafka
+```
+
+### ServiceMonitors
+
+```bash
+kubectl apply -f monitoring/prometheus/servicemonitor-kafka.yaml
+```
+
+### Kafka Exporter (consumer lag)
+
+```bash
+kubectl apply -f monitoring/kafka-exporter/kafka-exporter.yaml
+```
+
+The exporter scrapes per-partition lag from Kafka's consumer group API and exposes it on `:9308`. Prometheus scrapes it every 30s via a ServiceMonitor.
 
 ---
 
@@ -863,39 +863,41 @@ spec:
 ### Access Grafana
 
 ```bash
-# Port-forward Grafana
-kubectl port-forward svc/kube-prometheus-stack-grafana \
-  3000:80 -n monitoring
-
-# Get admin password
-kubectl get secret kube-prometheus-stack-grafana -n monitoring \
-  -o jsonpath='{.data.admin-password}' | base64 -d
+kubectl port-forward svc/kube-prometheus-stack-grafana 3001:80 -n monitoring
+# Username: admin
+# Password: $(kubectl get secret kube-prometheus-stack-grafana -n monitoring \
+#              -o jsonpath='{.data.admin-password}' | base64 -d)
 ```
 
-### Recommended Dashboards (Import by ID)
+### Official Strimzi Dashboards (auto-loaded via sidecar)
 
-| Dashboard | Grafana ID | Description |
-|-----------|-----------|-------------|
-| Kafka Overview | 7589 | Broker metrics, throughput, partitions |
-| Kafka Topics | 12460 | Per-topic metrics |
-| Consumer Lag | 12479 | Consumer group lag monitoring |
-| Kafka Connect | 11285 | Connector status and throughput |
-| ZooKeeper | 10465 | ZooKeeper ensemble health |
-| JVM Overview | 8563 | JVM memory, GC, threads |
+Dashboards are provisioned as ConfigMaps with label `grafana_dashboard: "1"`. The Grafana sidecar container auto-discovers and loads them without a pod restart.
 
-### Import via ConfigMap (GitOps)
+| Dashboard | File | Content |
+|-----------|------|---------|
+| Strimzi Kafka | `strimzi-kafka-configmap.yaml` | Broker metrics, partition leadership, log sizes |
+| Strimzi Kafka Exporter | `strimzi-kafka-exporter-configmap.yaml` | Consumer group lag per topic/partition |
+| Strimzi Kafka Connect | `strimzi-kafka-connect-configmap.yaml` | Connector status, task throughput |
+| Strimzi Operators | `strimzi-operators-configmap.yaml` | Operator reconciliation event rates |
 
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: kafka-overview-dashboard
-  namespace: monitoring
-  labels:
-    grafana_dashboard: "1"
-data:
-  kafka-overview.json: |
-    <paste dashboard JSON here>
+JSON sources: `strimzi-kafka-operator` GitHub tag `0.44.0`, path `examples/metrics/grafana-dashboards/`.
+
+```bash
+kubectl apply -f monitoring/grafana/dashboards/
+```
+
+### Re-generate dashboard ConfigMaps (if JSON changes)
+
+```bash
+for name in strimzi-kafka strimzi-kafka-exporter strimzi-kafka-connect strimzi-operators; do
+  kubectl create configmap "grafana-dashboard-${name}" \
+    --from-file="${name}.json=monitoring/grafana/dashboards/${name}.json" \
+    --namespace monitoring \
+    --dry-run=client -o yaml | \
+    sed 's/^  namespace: monitoring$/  namespace: monitoring\n  labels:\n    grafana_dashboard: "1"/' \
+    > "monitoring/grafana/dashboards/${name}-configmap.yaml"
+  kubectl apply -f "monitoring/grafana/dashboards/${name}-configmap.yaml"
+done
 ```
 
 ---
@@ -904,130 +906,36 @@ data:
 
 ### `monitoring/prometheus/rules/kafka-alerts.yaml`
 
-```yaml
-apiVersion: monitoring.coreos.com/v1
-kind: PrometheusRule
-metadata:
-  name: kafka-alerts
-  namespace: monitoring
-  labels:
-    release: kube-prometheus-stack
-spec:
-  groups:
-    - name: kafka.broker
-      rules:
-        - alert: KafkaBrokerDown
-          expr: count(up{job="kafka"} == 0) > 0
-          for: 1m
-          labels:
-            severity: critical
-          annotations:
-            summary: "Kafka broker is down"
-            description: "{{ $value }} Kafka broker(s) are not reachable."
+7 rules applied:
 
-        - alert: KafkaUnderReplicatedPartitions
-          expr: kafka_server_replicamanager_underreplicatedpartitions > 0
-          for: 5m
-          labels:
-            severity: warning
-          annotations:
-            summary: "Under-replicated partitions detected"
-            description: "Broker {{ $labels.pod }} has {{ $value }} under-replicated partitions."
+| Alert | Severity | Condition |
+|-------|----------|-----------|
+| `KafkaBrokerDown` | critical | Any broker unreachable for > 1m |
+| `KafkaUnderReplicatedPartitions` | warning | Under-replicated partitions for > 5m |
+| `KafkaOfflinePartitions` | critical | Offline partitions for > 1m |
+| `KafkaConsumerLagHigh` | warning | Total lag > 10,000 for > 10m |
+| `KafkaDiskUsageHigh` | warning | PVC usage > 80% for > 5m |
+| `KafkaISRShrinkage` | warning | ISR shrink rate > 0 for > 5m |
+| `KafkaActiveControllerCount` | critical | Active controller != 1 |
 
-        - alert: KafkaOfflinePartitions
-          expr: kafka_controller_kafkacontroller_offlinepartitionscount > 0
-          for: 1m
-          labels:
-            severity: critical
-          annotations:
-            summary: "Offline partitions detected"
-            description: "There are {{ $value }} offline partitions."
-
-        - alert: KafkaConsumerLagHigh
-          expr: sum(kafka_consumer_group_lag) by (group, topic) > 10000
-          for: 10m
-          labels:
-            severity: warning
-          annotations:
-            summary: "High consumer lag"
-            description: "Consumer group {{ $labels.group }} on topic {{ $labels.topic }} has lag {{ $value }}."
-
-        - alert: KafkaDiskUsageHigh
-          expr: >
-            (kubelet_volume_stats_used_bytes{persistentvolumeclaim=~"data-.*kafka.*"} /
-             kubelet_volume_stats_capacity_bytes{persistentvolumeclaim=~"data-.*kafka.*"}) > 0.80
-          for: 5m
-          labels:
-            severity: warning
-          annotations:
-            summary: "Kafka disk usage above 80%"
-            description: "PVC {{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} full."
-
-        - alert: KafkaISRShrinkage
-          expr: kafka_server_replicamanager_isrshrinkspersec > 0
-          for: 5m
-          labels:
-            severity: warning
-          annotations:
-            summary: "ISR shrinkage detected"
-            description: "ISR shrinkage occurring on broker {{ $labels.pod }}."
-```
-
-### AlertManager Config (Slack + PagerDuty)
-
-```yaml
-apiVersion: monitoring.coreos.com/v1alpha1
-kind: AlertmanagerConfig
-metadata:
-  name: kafka-alertmanager-config
-  namespace: monitoring
-spec:
-  route:
-    groupBy: ["alertname", "cluster"]
-    groupWait: 30s
-    groupInterval: 5m
-    repeatInterval: 12h
-    receiver: slack-critical
-    routes:
-      - matchers:
-          - name: severity
-            value: critical
-        receiver: pagerduty-critical
-      - matchers:
-          - name: severity
-            value: warning
-        receiver: slack-warning
-  receivers:
-    - name: slack-critical
-      slackConfigs:
-        - apiURL:
-            name: alertmanager-secrets
-            key: slack-webhook-url
-          channel: "#kafka-critical"
-          title: "CRITICAL: {{ .GroupLabels.alertname }}"
-          text: "{{ range .Alerts }}{{ .Annotations.description }}\n{{ end }}"
-    - name: pagerduty-critical
-      pagerdutyConfigs:
-        - routingKey:
-            name: alertmanager-secrets
-            key: pagerduty-routing-key
-          description: "{{ .GroupLabels.alertname }}: {{ .CommonAnnotations.summary }}"
-    - name: slack-warning
-      slackConfigs:
-        - apiURL:
-            name: alertmanager-secrets
-            key: slack-webhook-url
-          channel: "#kafka-warnings"
+```bash
+kubectl apply -f monitoring/prometheus/rules/kafka-alerts.yaml
+kubectl get prometheusrule kafka-alerts -n monitoring
 ```
 
 ---
 
 ## 15. Storage Configuration
 
-### `storage/storageclass.yaml`
+### Local dev (k3d)
 
 ```yaml
-# For AWS EKS (gp3)
+storageClassName: local-path   # rancher.io/local-path provisioner
+```
+
+### Production (AWS EKS gp3)
+
+```yaml
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -1043,141 +951,73 @@ reclaimPolicy: Retain
 allowVolumeExpansion: true
 ```
 
-**Storage Best Practices:**
-
-- Use `Retain` reclaim policy — prevent accidental data loss on PVC delete
-- Use `WaitForFirstConsumer` — ensures PVCs are created in the same AZ as the pod
-- Enable volume expansion for online resizing
-- Use SSDs (gp3 on AWS, pd-ssd on GCP) for broker data volumes
-- Separate volumes for data and logs where possible
+**Best practices:**
+- `Retain` reclaim policy — prevents accidental data loss on PVC delete
+- `WaitForFirstConsumer` — co-locates PVC with broker pod in same AZ
+- Use SSDs (gp3 / pd-ssd) for data volumes
+- Enable volume expansion (`allowVolumeExpansion: true`)
 
 ---
 
 ## 16. Network Policies
 
+### Port reference
+
+| Port | Service | Direction |
+|------|---------|-----------|
+| 9090 | Kafka internal | Operator → brokers |
+| 9091 | Kafka internal | Broker ↔ broker |
+| 9092 | Kafka plain | Clients (kafka ns) |
+| 9093 | Kafka TLS | Clients (kafka ns) |
+| 9308 | Kafka Exporter | Prometheus → exporter |
+| 9404 | JMX Exporter | Prometheus → brokers |
+| 8081 | Schema Registry | Internal + monitoring |
+
 ### `network-policies/kafka-network-policy.yaml`
 
 ```yaml
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: kafka-broker-network-policy
-  namespace: kafka
-spec:
-  podSelector:
-    matchLabels:
-      strimzi.io/kind: Kafka
-  policyTypes:
-    - Ingress
-    - Egress
-  ingress:
-    # Allow from Strimzi operator
-    - from:
-        - podSelector:
-            matchLabels:
-              name: strimzi-cluster-operator
-      ports:
-        - port: 9090
-        - port: 9091
-    # Allow broker-to-broker replication
-    - from:
-        - podSelector:
-            matchLabels:
-              strimzi.io/kind: Kafka
-      ports:
-        - port: 9091
-    # Allow clients within kafka namespace
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kafka
-      ports:
-        - port: 9092
-        - port: 9093
-    # Allow Prometheus scraping
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: monitoring
-      ports:
-        - port: 9404
-  egress:
-    - to:
-        - podSelector:
-            matchLabels:
-              strimzi.io/kind: Kafka
-    - to:
-        - podSelector:
-            matchLabels:
-              strimzi.io/kind: ZooKeeper
-    - ports:
-        - port: 53
-          protocol: UDP
+# Ingress from monitoring: both JMX (9404) and Kafka Exporter (9308)
+- from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+  ports:
+    - port: 9404
+    - port: 9308
 ```
+
+### `network-policies/monitoring-network-policy.yaml`
+
+```yaml
+egress:
+  - to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kafka
+    ports:
+      - port: 9404
+      - port: 9308   # Required for Kafka Exporter scraping
+```
+
+> **Common mistake:** Forgetting port 9308 in both policies causes Prometheus target to show `State: down, connection refused` even though the Kafka Exporter pod is healthy. See [Issue 8](#issue-8--network-policy-blocks-prometheus-from-scraping-kafka-exporter-port-9308).
 
 ---
 
 ## 17. Scaling and Performance Tuning
 
-### Horizontal Scaling (Add Brokers)
+### Horizontal Scaling (KRaft)
 
 ```bash
-# Scale broker count (ZooKeeper-mode)
-kubectl patch kafka production-kafka -n kafka \
-  --type=merge -p '{"spec":{"kafka":{"replicas":5}}}'
-
-# Scale with KafkaNodePool (KRaft-mode)
+# Scale broker count
 kubectl patch kafkanodepool broker -n kafka \
   --type=merge -p '{"spec":{"replicas":5}}'
 ```
 
-### Partition Rebalancing with Cruise Control
+### Producer Tuning (high-throughput)
 
-Add Cruise Control to the Kafka CR for automated partition rebalancing:
-
-```yaml
-spec:
-  cruiseControl:
-    brokerCapacity:
-      inboundNetwork: 10000KB/s
-      outboundNetwork: 10000KB/s
-    config:
-      replication.throttle: 50000000
-    resources:
-      requests:
-        memory: 1Gi
-        cpu: 500m
-      limits:
-        memory: 2Gi
-        cpu: "1"
-```
-
-```bash
-# Trigger rebalance via KafkaRebalance CR
-kubectl apply -f - <<EOF
-apiVersion: kafka.strimzi.io/v1beta2
-kind: KafkaRebalance
-metadata:
-  name: full-rebalance
-  namespace: kafka
-  labels:
-    strimzi.io/cluster: production-kafka
-spec:
-  mode: full
-EOF
-
-# Approve rebalance
-kubectl annotate kafkarebalance full-rebalance \
-  strimzi.io/rebalance=approve -n kafka
-```
-
-### Producer/Consumer Tuning
-
-**Producer (high-throughput):**
 ```properties
 acks=all
 retries=2147483647
-max.in.flight.requests.per.connection=5
 enable.idempotence=true
 compression.type=lz4
 batch.size=65536
@@ -1185,7 +1025,8 @@ linger.ms=5
 buffer.memory=67108864
 ```
 
-**Consumer (low-latency):**
+### Consumer Tuning (low-latency)
+
 ```properties
 fetch.min.bytes=1
 fetch.max.wait.ms=10
@@ -1194,35 +1035,37 @@ enable.auto.commit=false
 isolation.level=read_committed
 ```
 
+### Partition Rebalancing (Production — Cruise Control)
+
+> **Local dev:** Do NOT add Cruise Control to a running cluster without a clean slate. It triggers a rolling restart that can deadlock if the existing pod spec has stale env vars. See [Issue 7](#issue-7--cruise-control-triggers-rolling-restart-deadlock).
+
+```yaml
+spec:
+  cruiseControl:
+    brokerCapacity:
+      inboundNetwork: 10000KB/s
+      outboundNetwork: 10000KB/s
+```
+
 ---
 
 ## 18. Backup and Recovery
 
-### Topic Backup with MirrorMaker 2
-
-Use MirrorMaker 2 to continuously replicate to a secondary cluster or cold storage region.
-
 ### Manual Offset Checkpoint
 
 ```bash
-# Export consumer group offsets
-kubectl exec -it production-kafka-kafka-0 -n kafka -- \
-  bin/kafka-consumer-groups.sh \
-  --bootstrap-server localhost:9092 \
-  --group my-consumer-group \
-  --describe > consumer-offsets-backup.txt
+kubectl run kafka-groups --image=quay.io/strimzi/kafka:0.44.0-kafka-3.7.0 \
+  --restart=Never --namespace=kafka --rm -i \
+  --command -- /opt/kafka/bin/kafka-consumer-groups.sh \
+    --bootstrap-server production-kafka-kafka-bootstrap:9092 \
+    --describe --all-groups
 ```
+
+> **Note:** Always use full path `/opt/kafka/bin/` in `--command` mode. The `PATH` does not include `/opt/kafka/bin` when using `kubectl run --command`. See [Load Test section](#load-test--verification).
 
 ### PVC Snapshot (Velero)
 
 ```bash
-# Install Velero with CSI plugin
-helm install velero vmware-tanzu/velero \
-  --namespace velero \
-  --set-json 'configuration.features=["EnableCSI"]' \
-  --set snapshotsEnabled=true
-
-# Create scheduled backup
 velero schedule create kafka-daily \
   --schedule="0 2 * * *" \
   --include-namespaces kafka \
@@ -1240,22 +1083,21 @@ velero schedule create kafka-daily \
 kubectl get deployment strimzi-cluster-operator -n kafka \
   -o jsonpath='{.spec.template.spec.containers[0].image}'
 
-# 2. Upgrade operator (rolling)
+# 2. Upgrade operator
 helm upgrade strimzi-kafka-operator strimzi/strimzi-kafka-operator \
   --namespace kafka \
   --reuse-values \
   --version 0.45.0
 
-# 3. Update Kafka version in CR (triggers rolling broker restart)
+# 3. Update Kafka version (triggers rolling broker restart)
 kubectl patch kafka production-kafka -n kafka \
   --type=merge -p '{"spec":{"kafka":{"version":"3.8.0","metadataVersion":"3.8-IV0"}}}'
 ```
 
-**Upgrade Rules:**
-- Upgrade Strimzi operator first, then update Kafka version in the CR
-- Never skip more than one minor version of Strimzi
-- Always check the Strimzi upgrade guide for breaking changes
-- Test upgrades in staging before production
+**Rules:**
+- Upgrade Strimzi operator first, then update Kafka version
+- Never skip more than one minor Strimzi version
+- Test in staging before production
 
 ---
 
@@ -1265,47 +1107,107 @@ kubectl patch kafka production-kafka -n kafka \
 
 | Symptom | Check | Resolution |
 |---------|-------|------------|
-| Broker pod stuck in `Pending` | `kubectl describe pod` | Check node capacity, PVC binding, taints |
-| `NotLeaderForPartition` errors | Check under-replicated partitions | Wait for ISR recovery; check network |
-| Consumer lag growing | Monitor `kafka_consumer_group_lag` | Scale consumers; increase partitions |
-| OOM killed broker | JVM heap settings | Increase `-Xmx`; check heap dump |
-| ZooKeeper session timeout | ZK leader election | Check ZK pod logs; ensure quorum |
-| Topic operator reconcile loop | `kubectl logs entity-operator` | Check KafkaTopic CR status conditions |
+| Strimzi crashes with `emulationMajor` | k3s version | Use k3s v1.31.6 (see [Issue 1](#issue-1--k3s-v133-incompatible-with-strimzi-044)) |
+| Broker pod stuck in `Init:0/1` | `kubectl logs <pod> -c kafka-init` | Remove external NodePort listener (see [Issue 6](#issue-6--kafka-init-closedchannelexception-with-nodeport-external-listener)) |
+| Schema Registry CrashLoopBackOff | `kubectl logs schema-registry` | Add `enableServiceLinks: false` (see [Issue 5](#issue-5--schema-registry-crashloopbackoff)) |
+| Prometheus target `down (connection refused)` | Check network policies | Add port 9308 to both policies (see [Issue 8](#issue-8--network-policy-blocks-prometheus-from-scraping-kafka-exporter-port-9308)) |
+| Broker pod stuck in `Pending` | `kubectl describe pod` | Check node capacity, PVC binding, StorageClass |
+| `verify-cluster.sh` exits after 1 check | `set -euo pipefail` + `((PASS++))` | Use `PASS=$((PASS+1))` (see [Issue 4](#issue-4--verify-clustersh-exits-immediately-on-first-success)) |
+| Consumer lag growing | Kafka Exporter metrics | Scale consumers; check `kafka_consumergroup_lag_sum` |
 
 ### Useful Commands
 
 ```bash
-# Kafka cluster status
-kubectl get kafka production-kafka -n kafka -o yaml | grep -A5 conditions
+# Cluster health
+bash scripts/verify-cluster.sh
+
+# Kafka cluster CR status
+kubectl get kafka production-kafka -n kafka -o jsonpath='{.status.conditions}' | python3 -m json.tool
 
 # Broker logs
-kubectl logs -f production-kafka-kafka-0 -n kafka -c kafka
+kubectl logs -f production-kafka-combined-0 -n kafka -c kafka
 
-# List topics
-kubectl exec -it production-kafka-kafka-0 -n kafka -- \
-  bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+# List topics + offsets
+kubectl run kafka-offsets --image=quay.io/strimzi/kafka:0.44.0-kafka-3.7.0 \
+  --restart=Never --namespace=kafka --rm -i \
+  --command -- /opt/kafka/bin/kafka-get-offsets.sh \
+    --bootstrap-server production-kafka-kafka-bootstrap:9092 \
+    --topic payments.orders.created.v1
 
 # Consumer group lag
-kubectl exec -it production-kafka-kafka-0 -n kafka -- \
-  bin/kafka-consumer-groups.sh \
-  --bootstrap-server localhost:9092 \
-  --describe --all-groups
+kubectl run kafka-groups --image=quay.io/strimzi/kafka:0.44.0-kafka-3.7.0 \
+  --restart=Never --namespace=kafka --rm -i \
+  --command -- /opt/kafka/bin/kafka-consumer-groups.sh \
+    --bootstrap-server production-kafka-kafka-bootstrap:9092 \
+    --describe --all-groups
 
-# Describe KRaft quorum
-kubectl exec -it production-kafka-kafka-0 -n kafka -- \
-  bin/kafka-metadata-quorum.sh \
-  --bootstrap-server localhost:9092 describe --status
+# KRaft quorum status
+kubectl run kafka-quorum --image=quay.io/strimzi/kafka:0.44.0-kafka-3.7.0 \
+  --restart=Never --namespace=kafka --rm -i \
+  --command -- /opt/kafka/bin/kafka-metadata-quorum.sh \
+    --bootstrap-server production-kafka-kafka-bootstrap:9092 describe --status
 
-# Check Strimzi operator logs
-kubectl logs -f deploy/strimzi-cluster-operator -n kafka
+# Prometheus scrape targets (check kafka-exporter is up)
+kubectl exec -n monitoring -c prometheus \
+  $(kubectl get pod -n monitoring -l app.kubernetes.io/name=prometheus --no-headers -o name | head -1) \
+  -- wget -qO- 'http://localhost:9090/api/v1/targets' | \
+  python3 -c "import sys,json; [print(t['scrapeUrl'], t['health']) for t in json.load(sys.stdin)['data']['activeTargets'] if 'kafka' in t.get('scrapeUrl','')]"
 
-# Force topic reconciliation
-kubectl annotate kafkatopic my-topic \
-  strimzi.io/force-reconcile=true -n kafka
+# Kafka Exporter raw metrics
+kubectl exec -n kafka deployment/kafka-exporter -- \
+  wget -qO- http://localhost:9308/metrics | grep kafka_consumergroup_lag_sum
+```
 
-# Inspect Prometheus metrics
-kubectl port-forward svc/production-kafka-kafka-brokers 9404:9404 -n kafka
-curl -s http://localhost:9404/metrics | grep kafka_server_broker
+---
+
+## Load Test & Verification
+
+### Produce Load
+
+```bash
+# Produce 1000 messages to payments topic
+kubectl run kafka-producer \
+  --image=quay.io/strimzi/kafka:0.44.0-kafka-3.7.0 \
+  --restart=Never --namespace=kafka \
+  --command -- /bin/bash -c '
+    for i in $(seq 1 1000); do
+      echo "key-$i:{\"orderId\":$i,\"amount\":$((RANDOM % 500 + 10))}"
+    done | /opt/kafka/bin/kafka-console-producer.sh \
+      --bootstrap-server production-kafka-kafka-bootstrap:9092 \
+      --topic payments.orders.created.v1 \
+      --property parse.key=true --property key.separator=:
+  '
+```
+
+> **Important:** Always use `/opt/kafka/bin/` prefix in `--command` mode. The shell PATH does not include `/opt/kafka/bin` when `kubectl run` uses `--command`, so bare script names like `kafka-console-producer.sh` will report "command not found" silently (exit 0 due to echo at end of script).
+
+### Consume and Verify
+
+```bash
+kubectl run kafka-consumer \
+  --image=quay.io/strimzi/kafka:0.44.0-kafka-3.7.0 \
+  --restart=Never --namespace=kafka \
+  --command -- /opt/kafka/bin/kafka-console-consumer.sh \
+    --bootstrap-server production-kafka-kafka-bootstrap:9092 \
+    --topic payments.orders.created.v1 \
+    --from-beginning \
+    --group payments-service-group \
+    --max-messages 1000 \
+    --timeout-ms 60000
+```
+
+### Verify in Prometheus
+
+```bash
+# Query consumer lag (should appear after one 30s scrape cycle)
+kubectl exec -n monitoring -c prometheus \
+  $(kubectl get pod -n monitoring -l app.kubernetes.io/name=prometheus --no-headers -o name | head -1) \
+  -- wget -qO- 'http://localhost:9090/api/v1/query?query=kafka_consumergroup_lag_sum' | \
+  python3 -c "
+import sys, json
+for r in json.load(sys.stdin)['data']['result']:
+    print(r['metric'].get('consumergroup'), r['metric'].get('topic'), '→ lag =', r['value'][1])
+"
 ```
 
 ---
@@ -1313,50 +1215,20 @@ curl -s http://localhost:9404/metrics | grep kafka_server_broker
 ## Quick Start (All-in-One)
 
 ```bash
-#!/bin/bash
-# scripts/install.sh
+# 1. Create k3d cluster (k3s v1.31.6 required)
+k3d cluster create kafka-local \
+  --image rancher/k3s:v1.31.6-k3s1 \
+  --servers 1 --agents 3
 
-set -euo pipefail
+# 2. Run full install
+bash scripts/install.sh
 
-NAMESPACE_KAFKA=kafka
-NAMESPACE_MONITORING=monitoring
+# 3. Verify all 17 checks pass
+bash scripts/verify-cluster.sh
 
-echo "Creating namespaces..."
-kubectl create namespace $NAMESPACE_KAFKA --dry-run=client -o yaml | kubectl apply -f -
-kubectl create namespace $NAMESPACE_MONITORING --dry-run=client -o yaml | kubectl apply -f -
-
-echo "Installing Strimzi operator..."
-helm repo add strimzi https://strimzi.io/charts/
-helm upgrade --install strimzi-kafka-operator strimzi/strimzi-kafka-operator \
-  -n $NAMESPACE_KAFKA --version 0.44.0 --wait
-
-echo "Applying storage class..."
-kubectl apply -f storage/
-
-echo "Deploying Kafka cluster..."
-kubectl apply -f strimzi/cluster/ -n $NAMESPACE_KAFKA
-kubectl wait kafka/production-kafka --for=condition=Ready \
-  --timeout=600s -n $NAMESPACE_KAFKA
-
-echo "Applying topics and users..."
-kubectl apply -f strimzi/topics/ -n $NAMESPACE_KAFKA
-kubectl apply -f strimzi/users/ -n $NAMESPACE_KAFKA
-
-echo "Installing Prometheus + Grafana..."
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm upgrade --install kube-prometheus-stack \
-  prometheus-community/kube-prometheus-stack \
-  -n $NAMESPACE_MONITORING --version 58.0.0 \
-  -f monitoring/prometheus/values.yaml --wait
-
-echo "Applying ServiceMonitors..."
-kubectl apply -f monitoring/prometheus/ -n $NAMESPACE_MONITORING
-
-echo "Applying alert rules..."
-kubectl apply -f monitoring/prometheus/rules/ -n $NAMESPACE_MONITORING
-
-echo "Done! Access Grafana:"
-echo "  kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n monitoring"
+# 4. Access Grafana
+kubectl port-forward svc/kube-prometheus-stack-grafana 3001:80 -n monitoring &
+echo "Grafana: http://localhost:3001  user=admin  pass=$(kubectl get secret kube-prometheus-stack-grafana -n monitoring -o jsonpath='{.data.admin-password}' | base64 -d)"
 ```
 
 ---
@@ -1364,9 +1236,9 @@ echo "  kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n monito
 ## References
 
 - [Strimzi Documentation](https://strimzi.io/docs/operators/latest/)
-- [Strimzi GitHub](https://github.com/strimzi/strimzi-kafka-operator)
+- [Strimzi GitHub — v0.44.0](https://github.com/strimzi/strimzi-kafka-operator/tree/0.44.0)
+- [Strimzi Grafana Dashboards](https://github.com/strimzi/strimzi-kafka-operator/tree/0.44.0/examples/metrics/grafana-dashboards)
 - [Apache Kafka KRaft Mode](https://kafka.apache.org/documentation/#kraft)
 - [kube-prometheus-stack](https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack)
-- [Strimzi Grafana Dashboards](https://github.com/strimzi/strimzi-kafka-operator/tree/main/examples/metrics)
+- [Confluent Schema Registry](https://docs.confluent.io/platform/current/schema-registry/index.html)
 - [Kafka Performance Tuning Guide](https://kafka.apache.org/documentation/#producerconfigs)
-- [Cruise Control for Kafka](https://github.com/linkedin/cruise-control)

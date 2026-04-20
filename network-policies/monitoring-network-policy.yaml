@@ -24,6 +24,7 @@ spec:
               kubernetes.io/metadata.name: kafka
       ports:
         - port: 9404
+        - port: 9308
     - ports:
         - port: 53
           protocol: UDP
