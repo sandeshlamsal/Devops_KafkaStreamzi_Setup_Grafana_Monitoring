@@ -8,40 +8,136 @@ This repository documents the end-to-end setup of Apache Kafka on Kubernetes usi
 
 ## Current Deployment Status
 
-> Last verified: 2026-04-19
+> Last verified: 2026-04-20
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| Strimzi Operator v0.44.0 | ✅ Running | Helm, namespace `kafka` |
-| Kafka Cluster (KRaft, 3 nodes) | ✅ Ready | Kafka 3.7.0, combined controller+broker |
-| Entity Operator | ✅ Running | Topic + User operators |
-| KafkaTopics | ✅ Created | `payments.orders.created.v1` (6p), `inventory.products.updated.v1` (3p) |
-| KafkaUsers | ✅ Created | `payments-service`, `inventory-service` (TLS auth + ACLs) |
-| Kafka Connect | ✅ Running | Plain bootstrap, JsonConverter |
-| Schema Registry | ✅ Running | Confluent 7.6.0, plain 9092 |
-| Kafka Exporter | ✅ Scraping | Consumer lag metrics on `:9308` |
-| Prometheus | ✅ Running | kube-prometheus-stack v58.0.0 |
-| Grafana | ✅ Running | 4 Strimzi dashboards loaded |
-| AlertManager | ✅ Running | 7 PrometheusRules applied |
-| Network Policies | ✅ Applied | kafka + monitoring namespaces |
+---
+
+### Infrastructure — Where It Is Running
+
+**Cluster:** k3d `kafka-local` — k3s v1.31.6 running in Docker on macOS (Darwin 24.4.0)
+**API Server:** `https://0.0.0.0:63079`
+**Container runtime:** containerd 2.0.2-k3s2
+**Kernel:** 6.12.76-linuxkit (Linux VM inside Docker Desktop)
+
+#### Nodes
+
+```
+NAME                       ROLE            IP            VERSION        STATUS
+k3d-kafka-local-server-0   control-plane   172.19.0.3    v1.31.6+k3s1   Ready
+k3d-kafka-local-agent-0    worker          172.19.0.6    v1.31.6+k3s1   Ready
+k3d-kafka-local-agent-1    worker          172.19.0.4    v1.31.6+k3s1   Ready
+k3d-kafka-local-agent-2    worker          172.19.0.5    v1.31.6+k3s1   Ready
+```
+
+4 nodes total — 1 server (control plane) + 3 agents (workers).
+
+---
+
+#### Pods — namespace: `kafka`
+
+```
+POD                                          READY   STATUS      NODE                      IP
+production-kafka-combined-0                  1/1     Running     k3d-kafka-local-agent-0   10.42.0.4
+production-kafka-combined-1                  1/1     Running     k3d-kafka-local-agent-2   10.42.2.4
+production-kafka-combined-2                  1/1     Running     k3d-kafka-local-agent-1   10.42.1.4
+production-kafka-entity-operator-*           2/2     Running     k3d-kafka-local-server-0  10.42.3.3
+strimzi-cluster-operator-*                   1/1     Running     k3d-kafka-local-server-0  10.42.3.2
+production-connect-connect-0                 1/1     Running     k3d-kafka-local-agent-2   10.42.2.7
+schema-registry-*                            1/1     Running     k3d-kafka-local-agent-2   10.42.2.6
+kafka-exporter-*                             1/1     Running     k3d-kafka-local-server-0  10.42.3.8
+```
+
+> The 3 Kafka brokers land one per worker node (`agent-0`, `agent-1`, `agent-2`) — pod anti-affinity is working correctly. No two brokers share a node.
+
+---
+
+#### Pods — namespace: `monitoring`
+
+```
+POD                                               READY   STATUS    NODE                      IP
+prometheus-kube-prometheus-stack-prometheus-0     2/2     Running   k3d-kafka-local-agent-0   10.42.0.6
+alertmanager-kube-prometheus-stack-alertmanager-0 2/2     Running   k3d-kafka-local-server-0  10.42.3.7
+kube-prometheus-stack-grafana-*                   3/3     Running   k3d-kafka-local-agent-1   10.42.1.6
+kube-prometheus-stack-operator-*                  1/1     Running   k3d-kafka-local-server-0  10.42.3.6
+kube-prometheus-stack-kube-state-metrics-*        1/1     Running   k3d-kafka-local-server-0  10.42.3.5
+kube-prometheus-stack-prometheus-node-exporter    1/1     Running   k3d-kafka-local-agent-0   172.19.0.6
+kube-prometheus-stack-prometheus-node-exporter    1/1     Running   k3d-kafka-local-agent-1   172.19.0.4
+kube-prometheus-stack-prometheus-node-exporter    1/1     Running   k3d-kafka-local-agent-2   172.19.0.5
+kube-prometheus-stack-prometheus-node-exporter    1/1     Running   k3d-kafka-local-server-0  172.19.0.3
+```
+
+> Grafana runs 3 containers in one pod: main Grafana, `grafana-sc-dashboard` sidecar (watches ConfigMaps), and `grafana-sc-datasources` sidecar.
+> Node exporter runs as a DaemonSet — one pod per node for host-level CPU/memory/disk metrics.
+
+---
+
+#### Pod-to-Node Distribution
+
+```
+k3d-kafka-local-server-0 (control-plane, 172.19.0.3)
+  ├── strimzi-cluster-operator
+  ├── production-kafka-entity-operator
+  ├── kafka-exporter
+  ├── alertmanager
+  ├── kube-prometheus-stack-operator
+  ├── kube-prometheus-stack-kube-state-metrics
+  └── node-exporter (daemonset)
+
+k3d-kafka-local-agent-0 (worker, 172.19.0.6)
+  ├── production-kafka-combined-0   ◄── Kafka broker + controller
+  ├── prometheus
+  └── node-exporter (daemonset)
+
+k3d-kafka-local-agent-1 (worker, 172.19.0.4)
+  ├── production-kafka-combined-2   ◄── Kafka broker + controller
+  ├── grafana (3 containers)
+  └── node-exporter (daemonset)
+
+k3d-kafka-local-agent-2 (worker, 172.19.0.5)
+  ├── production-kafka-combined-1   ◄── Kafka broker + controller
+  ├── production-connect-connect-0
+  ├── schema-registry
+  └── node-exporter (daemonset)
+```
+
+---
+
+### Component Status
+
+| Component | Status | Version | Namespace |
+|-----------|--------|---------|-----------|
+| Strimzi Operator | ✅ Running | 0.44.0 | `kafka` |
+| Kafka Cluster (KRaft, 3 nodes) | ✅ Ready | 3.7.0 | `kafka` |
+| Entity Operator | ✅ Running (2/2) | — | `kafka` |
+| KafkaTopics | ✅ Created | — | `kafka` |
+| KafkaUsers | ✅ Created | — | `kafka` |
+| Kafka Connect | ✅ Running | 3.7.0 | `kafka` |
+| Schema Registry | ✅ Running | 7.6.0 | `kafka` |
+| Kafka Exporter | ✅ Scraping | latest | `kafka` |
+| Prometheus | ✅ Running (2/2) | v2.x | `monitoring` |
+| Grafana | ✅ Running (3/3) | — | `monitoring` |
+| AlertManager | ✅ Running (2/2) | — | `monitoring` |
+| Network Policies | ✅ Applied | — | both |
+
+---
 
 ### End-to-End Test Results
 
 ```
 === Topic Message Counts ===
-  payments.orders.created.v1:    3,005 messages (6 partitions)
-  inventory.products.updated.v1:   500 messages (3 partitions)
+  payments.orders.created.v1:    3,005 messages across 6 partitions
+  inventory.products.updated.v1:   500 messages across 3 partitions
 
-=== Consumer Group Lag (Prometheus-scraped) ===
-  payments-service-group / payments.orders.created.v1  → lag = 2,000  (deliberate, showing in Grafana)
+=== Consumer Group Lag (Prometheus-scraped via Kafka Exporter) ===
+  payments-service-group / payments.orders.created.v1  → lag = 2,000  (deliberate, visible in Grafana)
   inventory-service-group / inventory.products.updated.v1 → lag = 0   (fully consumed)
-  check-group / payments.orders.created.v1             → lag = 3,000  (only consumed 5 msgs)
+  check-group / payments.orders.created.v1             → lag = 3,000  (consumed only first 5 msgs)
 
-=== Grafana Dashboards (auto-loaded via sidecar) ===
-  ✅ Strimzi Kafka
-  ✅ Strimzi Kafka Exporter
-  ✅ Strimzi Kafka Connect
-  ✅ Strimzi Operators
+=== Grafana Dashboards (auto-loaded via ConfigMap sidecar) ===
+  ✅ Strimzi Kafka           — broker metrics, partition leadership, log sizes
+  ✅ Strimzi Kafka Exporter  — consumer group lag per topic/partition
+  ✅ Strimzi Kafka Connect   — connector status and task throughput
+  ✅ Strimzi Operators       — operator reconciliation event rates
 ```
 
 ---
