@@ -2011,6 +2011,142 @@ for r in json.load(sys.stdin)['data']['result']:
 
 ---
 
+## Teardown
+
+> Removes all Kafka and monitoring resources. Safe to run against a live or partially-dead cluster — every kubectl step is connection-error tolerant.
+
+### Script: `scripts/teardown.sh`
+
+**What it removes (in order):**
+
+| Step | What gets deleted |
+|------|------------------|
+| 1 | Port-forward processes (Grafana :3001, Prometheus :9090, Schema Registry :8081, etc.) |
+| 2 | Leftover test pods (`kafka-e2e`, `kafka-producer-*`, `kafka-consumer-*`, etc.) |
+| 3 | `KafkaConnector` CRs → Connect unregisters connectors |
+| 4 | `KafkaConnect` CR → operator tears down Connect pods |
+| 5 | `KafkaTopic` CRs → operator deletes topics from Kafka |
+| 6 | `KafkaUser` CRs → operator removes ACLs and user Secrets |
+| 7 | `Kafka` + `KafkaNodePool` CRs → operator gracefully stops all 3 broker pods |
+| 8 | Waits up to 120s for broker pods to fully terminate |
+| 9 | Helm: uninstall `strimzi-kafka-operator` |
+| 10 | `PrometheusRule`, `ServiceMonitor`, `AlertManagerConfig` CRs |
+| 11 | Grafana dashboard + datasource ConfigMaps |
+| 12 | Helm: uninstall `kube-prometheus-stack` |
+| 13 | PersistentVolumeClaims in `kafka` and `monitoring` namespaces |
+| 14 | NetworkPolicies in both namespaces |
+| 15 | Strimzi CRDs (`kafkas.kafka.strimzi.io`, etc.) |
+| 16 | Prometheus Operator CRDs (`prometheusrules.monitoring.coreos.com`, etc.) |
+| 17 | Namespaces: `kafka` and `monitoring` |
+| 18 | *(optional, prompt)* k3d cluster `kafka-local` |
+
+### Run
+
+```bash
+bash scripts/teardown.sh
+```
+
+You will be prompted once at the end to confirm k3d cluster deletion:
+```
+==> Delete the k3d cluster 'kafka-local' entirely? [y/N]
+```
+Answer `y` to fully destroy the cluster, `n` to keep the cluster and only remove the Kafka/monitoring stack.
+
+### Sample output (live run — 2026-04-20)
+
+```
+==> Verifying cluster context...
+    Current context: k3d-kafka-local
+
+==> Killing port-forward processes (Grafana, Prometheus, Schema Registry)...
+  [OK]  Killed process(es) on :3000 (PIDs: 838 24708 60991)
+
+==> Removing leftover test/load pods from namespace: kafka...
+
+==> Removing KafkaConnector CRs...
+  [--]  KafkaConnectors (none found) (skipping)
+
+==> Removing KafkaConnect CR...
+  [OK]  KafkaConnect deleted
+
+==> Removing KafkaTopic CRs...
+  [OK]  KafkaTopics deleted
+
+==> Removing KafkaUser CRs...
+  [OK]  KafkaUsers deleted
+
+==> Removing Kafka + KafkaNodePool CRs...
+  [OK]  Kafka CR deleted
+  [OK]  KafkaNodePools deleted
+
+==> Waiting for Kafka broker pods to terminate (up to 120s)...
+  [OK]  Broker pods terminated
+
+==> Uninstalling Strimzi Helm release...
+  [OK]  Strimzi operator uninstalled
+
+==> Removing PrometheusRule CRs...
+  [OK]  PrometheusRule deleted
+
+==> Removing ServiceMonitor CRs...
+  [OK]  ServiceMonitors deleted
+
+==> Removing Grafana dashboard and datasource ConfigMaps...
+  [OK]  Grafana ConfigMaps deleted
+
+==> Removing AlertManagerConfig CRs...
+  [OK]  AlertManagerConfigs deleted
+
+==> Uninstalling kube-prometheus-stack Helm release...
+  [OK]  kube-prometheus-stack uninstalled
+
+==> Removing PersistentVolumeClaims in kafka...
+  [OK]  PVCs deleted in kafka
+
+==> Removing PersistentVolumeClaims in monitoring...
+  [OK]  PVCs deleted in monitoring
+
+==> Removing NetworkPolicies...
+  [OK]  kafka NetworkPolicies deleted
+  [OK]  monitoring NetworkPolicies deleted
+
+==> Removing Strimzi CRDs...
+  [OK]  Strimzi CRDs removed
+
+==> Removing Prometheus Operator CRDs...
+  [OK]  Prometheus Operator CRDs removed
+
+==> Deleting namespace: kafka...
+  [OK]  Namespace kafka deleted
+
+==> Deleting namespace: monitoring...
+  [OK]  Namespace monitoring deleted
+
+==> Delete the k3d cluster 'kafka-local' entirely? [y/N] y
+  [OK]  k3d cluster 'kafka-local' deleted
+
+======================================================
+ Teardown complete: 22 steps OK, 0 failed
+======================================================
+```
+
+### Re-install from scratch after teardown
+
+```bash
+# 1. Recreate the k3d cluster
+k3d cluster create kafka-local \
+  --image rancher/k3s:v1.31.6-k3s1 \
+  --servers 1 --agents 3
+
+# 2. Run full install
+bash scripts/install.sh
+
+# 3. Verify
+bash scripts/verify-cluster.sh
+```
+
+---
+
 ## Quick Start (All-in-One)
 
 ```bash
